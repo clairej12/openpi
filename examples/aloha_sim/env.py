@@ -1,3 +1,8 @@
+# put these at the very top of your entrypoint, before other imports
+import os
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")  # defensive; some stacks check this
+
 import gym_aloha  # noqa: F401
 import gymnasium
 import numpy as np
