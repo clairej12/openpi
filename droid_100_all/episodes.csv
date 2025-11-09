@@ -1,0 +1,101 @@
+episode_index,episode_id,task_name,instruction_any,language_instruction,language_instruction_2,language_instruction_3,instruction_all_unique,num_states_collected
+0,ep000000,b'Put the marker in the pot',b'Put the marker in the pot',,,,,0
+1,ep000001,b'Put the candy bar on the left side of the first shelf',b'Put the candy bar on the left side of the first shelf',,,,,0
+2,ep000002,b'Put one green sachet in the grey bowl.',b'Put one green sachet in the grey bowl.',,,,,0
+3,ep000003,b'Place the pack of doritos inside the sink',b'Place the pack of doritos inside the sink',,,,,0
+4,ep000004,b'Move the sharpie to the table',b'Move the sharpie to the table',,,,,0
+5,ep000005,b'',b'',,,,,0
+6,ep000006,b'Take the pen out of the bowl and place it on the table',b'Take the pen out of the bowl and place it on the table',,,,,0
+7,ep000007,b'',b'',,,,,0
+8,ep000008,b'',b'',,,,,0
+9,ep000009,b'',b'',,,,,0
+10,ep000010,b'Move the pan to the right.',b'Move the pan to the right.',,,,,0
+11,ep000011,b'Move the glass to the second row in the dishwasher',b'Move the glass to the second row in the dishwasher',,,,,0
+12,ep000012,b'Pick up the lid from the table and put it on the pot',b'Pick up the lid from the table and put it on the pot',,,,,0
+13,ep000013,b'Pick up the black object from the striped towel and place it on the white sheet of paper on the right',b'Pick up the black object from the striped towel and place it on the white sheet of paper on the right',,,,,0
+14,ep000014,b'',b'',,,,,0
+15,ep000015,b'',b'',,,,,0
+16,ep000016,b'',b'',,,,,0
+17,ep000017,b'',b'',,,,,0
+18,ep000018,b'',b'',,,,,0
+19,ep000019,b'',b'',,,,,0
+20,ep000020,b'Slide the black lid off',b'Slide the black lid off',,,,,0
+21,ep000021,b'Put the orange rubber duck into the pot',b'Put the orange rubber duck into the pot',,,,,0
+22,ep000022,b'Use the duster to wipe the whiteboard',b'Use the duster to wipe the whiteboard',,,,,0
+23,ep000023,b'Turn off the left light switch',b'Turn off the left light switch',,,,,0
+24,ep000024,b'Put the tissues in the rubbish bin.',b'Put the tissues in the rubbish bin.',,,,,0
+25,ep000025,b'Put the middle fork in the middle section of the white object',b'Put the middle fork in the middle section of the white object',,,,,0
+26,ep000026,b'Put the  cable in the storage box',b'Put the  cable in the storage box',,,,,0
+27,ep000027,b'Put the bread in the toaster',b'Put the bread in the toaster',,,,,0
+28,ep000028,b'Put the white book on top of the tissue box.',b'Put the white book on top of the tissue box.',,,,,0
+29,ep000029,b'',b'',,,,,0
+30,ep000030,b'',b'',,,,,361
+31,ep000031,b'',b'',,,,,198
+32,ep000032,b'',b'',,,,,207
+33,ep000033,b'',b'',,,,,281
+34,ep000034,b'Move the vaseline closer to the mirror',b'Move the vaseline closer to the mirror',Move the vaseline closer to the mirror,Move the white bottle away from you,Pick up the Vaseline container and move it to the back of the counter,Move the vaseline closer to the mirror || Move the white bottle away from you || Pick up the Vaseline container and move it to the back of the counter,259
+35,ep000035,b'Put the towel on the bottle to the right',b'Put the towel on the bottle to the right',Put the towel on the bottle to the right,,,Put the towel on the bottle to the right,297
+36,ep000036,b'',b'',,,,,435
+37,ep000037,b'',b'',,,,,210
+38,ep000038,b'',b'',,,,,225
+39,ep000039,b'Take two folded white cloths out of the white box on the left',b'Take two folded white cloths out of the white box on the left',Take two folded white cloths out of the white box on the left,Put the clothes in the box on the table,Remove a cloth from the box,Put the clothes in the box on the table || Remove a cloth from the box || Take two folded white cloths out of the white box on the left,684
+40,ep000040,b'Put the objects on the table into the cardboard box',b'Put the objects on the table into the cardboard box',Put the objects on the table into the cardboard box,Put the items on the table in the box,"Pick up the bottle and two plastic bags, put them in the box and move the box to the left","Pick up the bottle and two plastic bags, put them in the box and move the box to the left || Put the items on the table in the box || Put the objects on the table into the cardboard box",833
+41,ep000041,b'',b'',,,,,89
+42,ep000042,b'',b'',,,,,331
+43,ep000043,b'',b'',,,,,158
+44,ep000044,b'',b'',,,,,390
+45,ep000045,b'',b'',,,,,293
+46,ep000046,b'',b'',,,,,320
+47,ep000047,b'',b'',,,,,129
+48,ep000048,b'',b'',,,,,229
+49,ep000049,b'',b'',,,,,162
+50,ep000050,b'Put the towel on the table into the box',b'Put the towel on the table into the box',Put the towel on the table into the box,,,Put the towel on the table into the box,1347
+51,ep000051,b'',b'',,,,,176
+52,ep000052,b'Turn the tap on and off and put the spoon in the dishes tray',b'Turn the tap on and off and put the spoon in the dishes tray',Turn the tap on and off and put the spoon in the dishes tray,,,Turn the tap on and off and put the spoon in the dishes tray,605
+53,ep000053,b'Pick up the computer mouse and put it in the microwave',b'Pick up the computer mouse and put it in the microwave',Pick up the computer mouse and put it in the microwave,,,Pick up the computer mouse and put it in the microwave,388
+54,ep000054,b'Put the marker inside the cup',b'Put the marker inside the cup',Put the marker inside the cup,Put the marker inside the blue cup,Put the marker in the cup,Put the marker in the cup || Put the marker inside the blue cup || Put the marker inside the cup,126
+55,ep000055,b'',b'',,,,,205
+56,ep000056,"b'Pick up the white towel and put it in the basket , pick up the marker and put it in the cup, then, pick up the yellow towel and put it in the basket, and finally pick up the masking tape and put it in the cup'","b'Pick up the white towel and put it in the basket , pick up the marker and put it in the cup, then, pick up the yellow towel and put it in the basket, and finally pick up the masking tape and put it in the cup'","Pick up the white towel and put it in the basket , pick up the marker and put it in the cup, then, pick up the yellow towel and put it in the basket, and finally pick up the masking tape and put it in the cup","Pick up the two towels and put them in the box, then pick up the marker and seal tape and put them in the cup",Pick up the towels and put them in the basket and then pick up the marker and the masking table and put them in the cup,"Pick up the towels and put them in the basket and then pick up the marker and the masking table and put them in the cup || Pick up the two towels and put them in the box, then pick up the marker and seal tape and put them in the cup || Pick up the white towel and put it in the basket , pick up the marker and put it in the cup, then, pick up the yellow towel and put it in the basket, and finally pick up the masking tape and put it in the cup",602
+57,ep000057,b'Press a button on the keyboard',b'Press a button on the keyboard',Press a button on the keyboard,Pick up the mouse,Press a button on the keyboard,Pick up the mouse || Press a button on the keyboard,304
+58,ep000058,b'',b'',,,,,213
+59,ep000059,b'',b'',,,,,148
+60,ep000060,b'Put the green block in the bowl',b'Put the green block in the bowl',Put the green block in the bowl,Put the green object in the bowl,Put the green block inside the black bowl,Put the green block in the bowl || Put the green block inside the black bowl || Put the green object in the bowl,144
+61,ep000061,b'',b'',,,,,50
+62,ep000062,b'',b'',,,,,826
+63,ep000063,b'',b'',,,,,217
+64,ep000064,b'',b'',,,,,284
+65,ep000065,b'',b'',,,,,200
+66,ep000066,b'Put the orange toy into the wooden box',b'Put the orange toy into the wooden box',Put the orange toy into the wooden box,,,Put the orange toy into the wooden box,140
+67,ep000067,b'',b'',,,,,283
+68,ep000068,b'Take the lid off the smaller pot',b'Take the lid off the smaller pot',Take the lid off the smaller pot,Take the lid off the silver pot and put it on the table,Take the silver lid from the silver pot and put it on the table,Take the lid off the silver pot and put it on the table || Take the lid off the smaller pot || Take the silver lid from the silver pot and put it on the table,211
+69,ep000069,b'Move the orange objects from the pullout table to the desk',b'Move the orange objects from the pullout table to the desk',Move the orange objects from the pullout table to the desk,Remove the orange objects from the drawer and put them on the table,Put the things on the sliding tray on the table,Move the orange objects from the pullout table to the desk || Put the things on the sliding tray on the table || Remove the orange objects from the drawer and put them on the table,401
+70,ep000070,b'Move the green plush to the left',b'Move the green plush to the left',Move the green plush to the left,Move the pee plush toy,Move the plush toy on the stove plate to the counter,Move the green plush to the left || Move the pee plush toy || Move the plush toy on the stove plate to the counter,100
+71,ep000071,"b'move one white object from the right heap to the left, then get the blue-white object and fold it on top of the left heap'","b'move one white object from the right heap to the left, then get the blue-white object and fold it on top of the left heap'","move one white object from the right heap to the left, then get the blue-white object and fold it on top of the left heap","Move the white clothing on the right to the pile of clothes on the left, place the checkered shirt on top of the pile on the left",Arrange the clothes on the bed,"Arrange the clothes on the bed || Move the white clothing on the right to the pile of clothes on the left, place the checkered shirt on top of the pile on the left || move one white object from the right heap to the left, then get the blue-white object and fold it on top of the left heap",440
+72,ep000072,b'',b'',,,,,336
+73,ep000073,b'',b'',,,,,389
+74,ep000074,b'Move the yellow mug forward',b'Move the yellow mug forward',Move the yellow mug forward,Move the yellow mug to the center of the table,Move the yellow cup backwards,Move the yellow cup backwards || Move the yellow mug forward || Move the yellow mug to the center of the table,167
+75,ep000075,b'Move the cup to the right',b'Move the cup to the right',Move the cup to the right,Move the glass to the right,Move the glass cup to the right.,Move the cup to the right || Move the glass cup to the right. || Move the glass to the right,226
+76,ep000076,b'',b'',,,,,171
+77,ep000077,b'Close the drawer',b'Close the drawer',Close the drawer,Close the drawer,Close the drawer,Close the drawer,100
+78,ep000078,b'',b'',,,,,323
+79,ep000079,b'',b'',,,,,13
+80,ep000080,b'',b'',,,,,1139
+81,ep000081,b'Turn the tap nozzle from the right to the middle then open the tap',b'Turn the tap nozzle from the right to the middle then open the tap',Turn the tap nozzle from the right to the middle then open the tap,Move the tap nozzle from the right to the middle then open the tap,Center the faucet and then lift the handle,Center the faucet and then lift the handle || Move the tap nozzle from the right to the middle then open the tap || Turn the tap nozzle from the right to the middle then open the tap,304
+82,ep000082,b'',b'',,,,,392
+83,ep000083,b'',b'',,,,,91
+84,ep000084,b'',b'',,,,,1627
+85,ep000085,b'',b'',,,,,130
+86,ep000086,b'',b'',,,,,86
+87,ep000087,b'',b'',,,,,573
+88,ep000088,b'',b'',,,,,127
+89,ep000089,b'Pick up one small bottle from the container and put it on the table.',b'Pick up one small bottle from the container and put it on the table.',Pick up one small bottle from the container and put it on the table.,Remove the white object from the plastic container,Put a small bottle on the table,Pick up one small bottle from the container and put it on the table. || Put a small bottle on the table || Remove the white object from the plastic container,186
+90,ep000090,b'',b'',,,,,661
+91,ep000091,b'Put the yellow cube inside the blue cup',b'Put the yellow cube inside the blue cup',Put the yellow cube inside the blue cup,Pick up the yellow tube and put it in the cup,Pick up the yellow object on the table and put it in the cup,Pick up the yellow object on the table and put it in the cup || Pick up the yellow tube and put it in the cup || Put the yellow cube inside the blue cup,100
+92,ep000092,b'Move the pot to the top left corner of the table',b'Move the pot to the top left corner of the table',Move the pot to the top left corner of the table,Move the pot to the top-left part of the table,Move the silver pot to the left,Move the pot to the top left corner of the table || Move the pot to the top-left part of the table || Move the silver pot to the left,125
+93,ep000093,b'Move the faucet to the center of the sink',b'Move the faucet to the center of the sink',Move the faucet to the center of the sink,Make the tap face forward,Turn the tap nozzle to the left,Make the tap face forward || Move the faucet to the center of the sink || Turn the tap nozzle to the left,210
+94,ep000094,b'',b'',,,,,200
+95,ep000095,b'',b'',,,,,157
+96,ep000096,b'Get the marker from the table and place it in the colorless cup',b'Get the marker from the table and place it in the colorless cup',Get the marker from the table and place it in the colorless cup,Put the red marker in the cup,Take the marker from the table and put it in the jug,Get the marker from the table and place it in the colorless cup || Put the red marker in the cup || Take the marker from the table and put it in the jug,337
+97,ep000097,"b'Pick the two bottles on the stove and place them on the counter, then pick the cooking stick from the pot and place it on the stove'","b'Pick the two bottles on the stove and place them on the counter, then pick the cooking stick from the pot and place it on the stove'","Pick the two bottles on the stove and place them on the counter, then pick the cooking stick from the pot and place it on the stove","Pick the bottles on the stove one by one, put them on the counter then take the wooden spatula out of the pot and put it on the stove",Move the spice bottles on the stove to the counter on the right of the stove and then put the wooden spoon on the pot directly on the stove top,"Move the spice bottles on the stove to the counter on the right of the stove and then put the wooden spoon on the pot directly on the stove top || Pick the bottles on the stove one by one, put them on the counter then take the wooden spatula out of the pot and put it on the stove || Pick the two bottles on the stove and place them on the counter, then pick the cooking stick from the pot and place it on the stove",577
+98,ep000098,b'Take the blocks out of the gift disappointed',b'Take the blocks out of the gift disappointed',Take the blocks out of the gift disappointed,Remove the blocks from the bowl one by one and place them on the table,Remove the colorful blocks from the black bowl and put them on the table,Remove the blocks from the bowl one by one and place them on the table || Remove the colorful blocks from the black bowl and put them on the table || Take the blocks out of the gift disappointed,1120
+99,ep000099,b'',b'',,,,,511

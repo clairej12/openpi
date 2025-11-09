@@ -1,0 +1,101 @@
+episode_index,episode_id,task_name,instruction_any,num_states_collected
+0,ep000000,,,167
+1,ep000001,,Put the blue block in the green bowl,266
+2,ep000002,,Move the bottom right tip of the duvet to the left,411
+3,ep000003,,Pick up the longer upright white container from the table and put it in the orange plastic bag,239
+4,ep000004,,,370
+5,ep000005,,,184
+6,ep000006,,,117
+7,ep000007,,Move the tile letter s to the left,316
+8,ep000008,,Remove the yellow toy from the green bowl and put it on the table.,163
+9,ep000009,,Pick the marker and put it in the plastic box,224
+10,ep000010,,Put the purple plush toy in the white bowl.,149
+11,ep000011,,Put the orange cup onto the windowsill,552
+12,ep000012,,Close the open drawer,112
+13,ep000013,,Use the white cloth to wipe the table,429
+14,ep000014,,Put the towel in the bowl,217
+15,ep000015,,Take the white plate off of the can and place it on the blue bowl,131
+16,ep000016,,Put the marker in the pot,176
+17,ep000017,,Put the green block on top of the other blocks,157
+18,ep000018,,Take the blue shirt and put it on the seat of the chair,152
+19,ep000019,,Open the drawer,135
+20,ep000020,,Put the white bottle on the orange plate,275
+21,ep000021,,Pick up the lid from the table and close the pot,234
+22,ep000022,,Pick the bottles and a red object and put them on the plate,836
+23,ep000023,,Remove the blue block from the top of the stack,168
+24,ep000024,,,1254
+25,ep000025,,Pick the pen on the table and put it in the bowl,222
+26,ep000026,,"Open the storage bin, then place the blue bottle inside it",274
+27,ep000027,,Open the compartment in the washing machine.,296
+28,ep000028,,Put the marker inside the white bowl,208
+29,ep000029,,,229
+30,ep000030,,Put the blue thing on the wooden rack on the table,101
+31,ep000031,,Sweep the candy to the left using the white and black brush,711
+32,ep000032,,Move the duster closer to you,113
+33,ep000033,,,1137
+34,ep000034,,,516
+35,ep000035,,Pick up the white coat hanger from the couch and hang it on the top rail,462
+36,ep000036,,Flip the left light switch on the wall,102
+37,ep000037,,Remove the marker from the silver pot and put it on the table,159
+38,ep000038,,Pick up the white object and the plastic then put them in the drawer.,364
+39,ep000039,,"move one white object from the right heap to the left, then get the blue-white object and fold it on top of the left heap",440
+40,ep000040,,,114
+41,ep000041,,,77
+42,ep000042,,Pick up the small blue packet from the countertop and put it in the black wire basket.,104
+43,ep000043,,Open the top kitchen cabinet door to the right,173
+44,ep000044,,Move the green cloth to the right,115
+45,ep000045,,Put the black knife in the open drawer,157
+46,ep000046,,Remove the lid from the bottle and put it on the couch,195
+47,ep000047,,Close the bottom drawer of the right cabinet,126
+48,ep000048,,Turn off the switch of the second slot from the left on the adapter,131
+49,ep000049,,Open the trash can then put the paper towel inside,397
+50,ep000050,,,544
+51,ep000051,,Put the towel on the seat of the chair,202
+52,ep000052,,Use a paper towel to clean the table,293
+53,ep000053,,,154
+54,ep000054,,Put the yellow block in the blue cup,90
+55,ep000055,,Pour the content in the orange cup into the two blue bowls start by pouring into the navy blue bowl and then into the neon blue bowl,307
+56,ep000056,,,213
+57,ep000057,,Move the bottle brush up and down repeatedly in the thermos flask,223
+58,ep000058,,Put the orange object in the bowl,123
+59,ep000059,,Use the towel to wipe the counter.,155
+60,ep000060,,Remove the glass lid from the silver pot and put it on the blue towel on the table,179
+61,ep000061,,,17
+62,ep000062,,Remove the circular object from the orange object,200
+63,ep000063,,Close the first top drawer,182
+64,ep000064,,,237
+65,ep000065,,Pick up the cup from the table and pour some of its contents in the orange bowl.,278
+66,ep000066,,,269
+67,ep000067,,Pull the curtain up,302
+68,ep000068,,Open the right door of the cabinet,157
+69,ep000069,,,1271
+70,ep000070,,Remove the bowls from the plate,195
+71,ep000071,,Pick up the green block from the yellow cube and put it on the yellow cuboid.,172
+72,ep000072,,,704
+73,ep000073,,"Pick up one pair of scissors, then place them in the clear object",376
+74,ep000074,,,290
+75,ep000075,,Put the packet inside the trash can,375
+76,ep000076,,,101
+77,ep000077,,Remove the yellow object from the bowl,167
+78,ep000078,,Remove the grey toy from the wooden box and put it on the top of the cabinet,209
+79,ep000079,,Put the orange thing into the bowl,158
+80,ep000080,,Put the duster on the whiteboard,250
+81,ep000081,,,878
+82,ep000082,,Use the paper towel to wipe the table,256
+83,ep000083,,Remove the black marker from the silver pot,160
+84,ep000084,,Get the keys and put them on the yellow sponge,280
+85,ep000085,,Remove the orange can from the plastic bowl and put it on the counter,192
+86,ep000086,,,157
+87,ep000087,,Take the white paper out of the drawer on the right.,204
+88,ep000088,,Move the green rectangular block to the right,109
+89,ep000089,,Remove two coffee cups from the stack at the front and place them on the left.,153
+90,ep000090,,Pick up the clear cup with beans in it and the silver cup simultaneously and put them in the clear storage container,215
+91,ep000091,,Open the top right drawer,359
+92,ep000092,,Pick the cap and put it on top of the bottle,395
+93,ep000093,,Pick up the snuck and put it in the sink,314
+94,ep000094,,Push the measuring tape back inside the case,263
+95,ep000095,,Move the white cup to the left,291
+96,ep000096,,Put the used napkin in the orange packet and then the bin,312
+97,ep000097,,Put the marker in the cup,352
+98,ep000098,,Put the container upright,235
+99,ep000099,,Pull the wooden handle towards you,110

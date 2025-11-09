@@ -1,0 +1,3 @@
+episode_index,episode_id,task_name,instruction,first_state_seen
+1,ep000001,b'Put the candy bar on the left side of the first shelf',b'Put the candy bar on the left side of the first shelf',42
+2,ep000002,b'Put one green sachet in the grey bowl.',b'Put one green sachet in the grey bowl.',0
