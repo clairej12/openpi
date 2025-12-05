@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
 analyze_action_multimodality.py
-Spectral version, parallelized, fast Euclidean affinity, and per-state checkpointing.
+Spectral version, parallelized, true symmetrized Minkowski distance on chunks,
+and per-state checkpointing.
 
 New in this version:
 - For every state i, we write:  outdir/per_state/state_{i:06d}.npz
 - On rerun, if that file exists, we just load it and skip recomputing.
 - At the end we aggregate ALL per-state files and still rank/plot top states.
+- Use Minkowski-distance-based variance and variance_drop_ratio.
+- Violin plot of variance_drop_ratio by k.
+- Plotly interactive 3D overview plots (HTML) in addition to PNGs.
 """
 
 import argparse, os, sys
@@ -20,6 +24,7 @@ from sklearn.cluster import SpectralClustering
 from scipy.spatial.distance import cdist
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import plotly.graph_objects as go
 
 # ------------------------------------------------------------------------------------
 # Globals for worker processes (set once by initializer)
@@ -41,46 +46,87 @@ def _init_worker(actions_arr, meta_records, args_dict):
 # distance + spectral clustering helpers
 # ------------------------------------------------------------------------------------
 
-def pairwise_sym_minkowski_from_points(X):
+def symmetrized_l2_minkowski_traj(X, Y):
     """
-    Build NxN symmetrized-Minkowski distances for already-flattened action points.
+    X: (T_x, A)  Y: (T_y, A)
+    d1^2 = sum_i min_j ||x_i - y_j||^2
+    d2^2 = sum_j min_i ||y_j - x_i||^2
+    d = sqrt( (d1^2 + d2^2) / 2 )
+    """
+    X = _as_2d(X)
+    Y = _as_2d(Y)
+    if X.shape[0] == 0 and Y.shape[0] == 0:
+        return 0.0
+    if X.shape[0] == 0 or Y.shape[0] == 0:
+        return np.inf
 
-    In your current setup each sample is just one flattened vector, so this is just
-    Euclidean pairwise — but we keep the function so we can swap in a true
-    sym-minkowski later.
+    dists_sq = cdist(X, Y, metric="sqeuclidean")  # (T_x, T_y)
+    d1_sq = np.sum(np.min(dists_sq, axis=1))      # sum_i min_j ||x_i - y_j||^2
+    d2_sq = np.sum(np.min(dists_sq, axis=0))      # sum_j min_i ||y_j - x_i||^2
+    return float(np.sqrt(0.5 * (d1_sq + d2_sq)))
+
+
+def compute_minkowski_distance_matrix(trajectories):
     """
-    X = np.asarray(X, float)
-    D = cdist(X, X, metric="euclidean")
+    trajectories: list of arrays, each (T_i, A) = one action chunk.
+    Returns D[i,j] = symmetrized_l2_minkowski_traj(traj_i, traj_j)
+    """
+    N = len(trajectories)
+    D = np.zeros((N, N), dtype=float)
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = symmetrized_l2_minkowski_traj(trajectories[i], trajectories[j])
+            D[i, j] = D[j, i] = d
     return D
+
+
+def _minkowski_variance_from_D(D):
+    """
+    D: (N, N) array of symmetrized Minkowski distances between chunks.
+    Implements:
+      E[d^2] + 2 (E[d])^2 - 2 E_x[ (E_{x'}[d(x,x')])^2 ]
+    where expectations are empirical over the N chunks.
+    """
+    D = np.asarray(D, float)
+    if D.size == 0:
+        return 0.0
+    # E_{x,x'}[d^2(x,x')]
+    term1 = float(np.mean(D ** 2))
+    # E_{x,x'}[d(x,x')]
+    mean_d = float(np.mean(D))
+    # E_x[(E_{x'}[d(x,x')])^2]
+    row_means = D.mean(axis=1)              # E_{x'}[d(x, x')]
+    term3 = float(np.mean(row_means ** 2))  # E_x[(E_{x'}[d])^2]
+    # return term1 + 2.0 * (mean_d ** 2) - 2.0 * term3
+    return 0.5 * term1
 
 
 def total_variance_minkowski(D):
     """
-    D: (N, N) pairwise distances in your "Minkowski" sense.
-    We'll use average squared distance as a dispersion measure.
+    Total variance of the set of action chunks, in Minkowski distance space.
     """
-    if D.size == 0:
-        return 0.0
-    return float(np.mean(D ** 2))
+    return _minkowski_variance_from_D(D)
 
 
 def weighted_incluster_variance_minkowski(D, labels):
     """
-    D: (N, N)
-    labels: cluster labels
-    Weighted average of within-cluster squared distances.
+    D: (N, N) distance matrix between chunks.
+    labels: cluster labels per chunk (length N).
+    Computes size-weighted average of cluster variances, with variance
+    defined via _minkowski_variance_from_D on the cluster submatrix.
     """
     labels = np.asarray(labels)
     N = D.shape[0]
     if N == 0:
         return 0.0
+
     wvar = 0.0
     for c in np.unique(labels):
         idx = np.where(labels == c)[0]
         if idx.size == 0:
             continue
         Dc = D[np.ix_(idx, idx)]
-        var_c = np.mean(Dc ** 2)
+        var_c = _minkowski_variance_from_D(Dc)
         wvar += (idx.size / N) * var_c
     return float(wvar)
 
@@ -162,12 +208,15 @@ def build_affinity_for_points(
 ):
     """
     Build NxN affinity from X (N x d) fast when we can.
+
+    NOTE: This helper still uses Euclidean for method="minkowski" and is only
+    used in some plotting/reclustering fallbacks. The main pipeline uses the
+    true Minkowski chunk distance above.
     """
     X = np.asarray(X, dtype=float)
     N = X.shape[0]
 
     if method == "minkowski":
-        # Fast path: we treat flat actions as points and just do Euclidean.
         D = cdist(X, X, metric="euclidean")
         pos = D[D > 0]
         sigma_used = float(np.median(pos)) if (sigma is None and pos.size) else (sigma or 1.0)
@@ -175,7 +224,7 @@ def build_affinity_for_points(
         np.fill_diagonal(A, 1.0)
         return A, D, sigma_used
 
-    # DTW path
+    # DTW path (rarely used in this script)
     trajs_points = [X[n:n + 1, :] for n in range(N)]
     D = compute_dtw_matrix(
         trajs_points,
@@ -228,15 +277,25 @@ def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
                      point_size=1, line_width=1.0, line_alpha=0.6,
                      line_color_mode="by_dominant_cluster",
                      start_marker_size=10, end_marker_size=20):
+    """
+    3D overview plot.
+
+    - Writes a static Matplotlib PNG at `png_path`.
+    - Also writes an interactive Plotly HTML with the same basename.
+    """
     import matplotlib.lines as mlines
-    fig = plt.figure(figsize=(7, 6))
-    ax = fig.add_subplot(111, projection="3d")
     xyz = np.asarray(xyz)
     labels = np.asarray(labels).reshape(-1)
     if labels.shape[0] != xyz.shape[0]:
         raise ValueError("labels length mismatch")
-    scatter = ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=labels, s=point_size, alpha=0.95)
+
+    # ---------------- Matplotlib static PNG ----------------
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    scatter = ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                         c=labels, s=point_size, alpha=0.95)
     start_h = end_h = None
+
     if index_rows is not None and len(index_rows) == xyz.shape[0]:
         sample_idx = np.array([r[1] for r in index_rows], dtype=int)
         action_idx = np.array([r[2] for r in index_rows], dtype=int)
@@ -256,14 +315,17 @@ def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
                 ax.plot(pts[:, 0], pts[:, 1], pts[:, 2],
                         linewidth=line_width, alpha=line_alpha, color=line_color)
             p0, p1 = pts[0], pts[-1]
-            ax.scatter([p0[0]], [p0[1]], [p0[2]], s=start_marker_size, c="none",
+            ax.scatter([p0[0]], [p0[1]], [p0[2]],
+                       s=start_marker_size, c="none",
                        edgecolor="k", linewidths=1.0, marker="o")
-            ax.scatter([p1[0]], [p1[1]], [p1[2]], s=end_marker_size, c="k",
+            ax.scatter([p1[0]], [p1[1]], [p1[2]],
+                       s=end_marker_size, c="k",
                        marker="x", linewidths=1.5)
         start_h = mlines.Line2D([], [], color="k", marker="o", markersize=6,
                                 markerfacecolor="none", linestyle="None", label="chunk start")
         end_h = mlines.Line2D([], [], color="k", marker="x", markersize=7,
                               linestyle="None", label="chunk end")
+
     legend_items = [mlines.Line2D([], [], color=scatter.cmap(scatter.norm(lab)),
                                   marker="s", linestyle="None", markersize=6,
                                   label=f"cluster {lab}") for lab in np.unique(labels)]
@@ -292,8 +354,91 @@ def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
     fig.savefig(png_path, dpi=150)
     plt.close(fig)
 
+    # ---------------- Plotly interactive HTML ----------------
+    fig_p = go.Figure()
 
-def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters, png_path, title_prefix="State",
+    fig_p.add_trace(
+        go.Scatter3d(
+            x=xyz[:, 0],
+            y=xyz[:, 1],
+            z=xyz[:, 2],
+            mode="markers",
+            marker=dict(
+                size=max(point_size, 2),
+                color=labels,
+                colorscale="Viridis",
+                opacity=0.9,
+                colorbar=dict(title="cluster"),
+            ),
+            name="points",
+        )
+    )
+
+    if index_rows is not None and len(index_rows) == xyz.shape[0]:
+        sample_idx = np.array([r[1] for r in index_rows], dtype=int)
+        action_idx = np.array([r[2] for r in index_rows], dtype=int)
+        unique_samples = np.unique(sample_idx)
+        first = True
+        for s in unique_samples:
+            m = (sample_idx == s)
+            order = np.argsort(action_idx[m])
+            pts = xyz[m][order]
+            if pts.shape[0] >= 2:
+                fig_p.add_trace(
+                    go.Scatter3d(
+                        x=pts[:, 0],
+                        y=pts[:, 1],
+                        z=pts[:, 2],
+                        mode="lines",
+                        line=dict(width=5.0),
+                        opacity=line_alpha,
+                        showlegend=False,
+                    )
+                )
+            p0, p1 = pts[0], pts[-1]
+            fig_p.add_trace(
+                go.Scatter3d(
+                    x=[p0[0]],
+                    y=[p0[1]],
+                    z=[p0[2]],
+                    mode="markers",
+                    marker=dict(size=3,
+                                symbol="circle-open",
+                                line=dict(width=2)),
+                    name="chunk start" if first else None,
+                    showlegend=first,
+                )
+            )
+            fig_p.add_trace(
+                go.Scatter3d(
+                    x=[p1[0]],
+                    y=[p1[1]],
+                    z=[p1[2]],
+                    mode="markers",
+                    marker=dict(size=3, symbol="x"),
+                    name="chunk end" if first else None,
+                    showlegend=first,
+                )
+            )
+            first = False
+
+    fig_p.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+
+    base, _ = os.path.splitext(png_path)
+    html_path = base + ".html"
+    fig_p.write_html(html_path, include_plotlyjs="cdn")
+
+
+def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters,
+                            png_path, title_prefix="State",
                             point_size=3, line_width=1.0, line_alpha=0.6):
     import matplotlib.lines as mlines
     xyz = np.asarray(xyz)
@@ -346,7 +491,8 @@ def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters, png_p
         for k in chunks_in_ci:
             m = (sample_idx == k)
             pts = xyz[m]
-            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size, alpha=0.95)
+            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                       s=point_size, alpha=0.95)
         for k in chunks_in_ci:
             m = (sample_idx == k)
             order = np.argsort(action_idx[m])
@@ -390,13 +536,10 @@ def _load_state_file(path):
     if best_arr.size == 0:
         best = None
     else:
-        # usually this is a single dict saved in a 1-element object array
         b = best_arr[0]
-        # if it's already a dict, just use it
         if isinstance(b, dict):
             best = b
         else:
-            # in case it’s some 0-d object array or something weird
             try:
                 best = b.item()
             except AttributeError:
@@ -406,7 +549,7 @@ def _load_state_file(path):
 
 
 def _save_state_file(path, rows, best):
-    tmp_path = path + ".tmp"   # ".../state_000123.npz.tmp"
+    tmp_path = path + ".tmp"
     with open(tmp_path, "wb") as f:
         np.savez_compressed(
             f,
@@ -429,25 +572,40 @@ def _process_state(i):
 
     state_path = _state_file_path(per_state_dir, i)
     if os.path.exists(state_path):
-        # already computed
         rows, best_cache = _load_state_file(state_path)
         return rows, best_cache
 
     acts_raw = actions_arr[i]
     try:
-        X = to_points(acts_raw)
+        arr = np.asarray(acts_raw)
+        if arr.ndim == 3:
+            # (K_chunks, T, A)
+            Kc, Tc, A = arr.shape
+            trajectories = [arr[k] for k in range(Kc)]             # each (T, A)
+            X_feat = arr.reshape(Kc, Tc * A).astype(float)         # for CH / silhouette
+        elif arr.ndim == 2:
+            # treat each time-step as a length-1 trajectory
+            Tc, A = arr.shape
+            trajectories = [arr[t:t+1, :] for t in range(Tc)]      # each (1, A)
+            X_feat = arr.astype(float)
+        else:
+            raise ValueError(f"Unsupported actions shape: {arr.shape}")
     except Exception as e:
         sys.stderr.write(f"[skip] state {i}: {e}\n")
         rows = []
         _save_state_file(state_path, rows, None)
         return rows, None
 
+    N_chunks = len(trajectories)
+
     # Optional subsample
     used_idx = None
-    if args["sample_cap"] is not None and X.shape[0] > args["sample_cap"]:
+    if args["sample_cap"] is not None and N_chunks > args["sample_cap"]:
         rng = np.random.RandomState(args["random_state"] + i)
-        used_idx = rng.choice(X.shape[0], args["sample_cap"], replace=False)
-        X = X[used_idx]
+        used_idx = rng.choice(N_chunks, args["sample_cap"], replace=False)
+        trajectories = [trajectories[j] for j in used_idx]
+        X_feat = X_feat[used_idx]
+        N_chunks = len(trajectories)
 
     # metadata
     if i < len(meta_records):
@@ -462,18 +620,23 @@ def _process_state(i):
         task_name = ""
         instruction = ""
 
-    # build affinity (fast), also build Minkowski distances for metrics
+    # build affinity, Minkowski distances + variance
     try:
-        A, _, _ = build_affinity_for_points(
-            X,
-            method=args["method"],
-            sigma=args["sigma"],
-            dtw_window=args["dtw_window"],
-            random_state=args["random_state"],
-            parallel_dtw=args["parallel_dtw"],
-            max_workers=args["max_workers"],
-        )
-        D_mink = pairwise_sym_minkowski_from_points(X)
+        if args["method"] == "minkowski":
+            D_mink = compute_minkowski_distance_matrix(trajectories)
+        else:
+            D_mink = compute_dtw_matrix(
+                trajectories,
+                window=args["dtw_window"],
+                parallelize=args["parallel_dtw"],
+                max_workers=args["max_workers"],
+            )
+
+        pos = D_mink[D_mink > 0]
+        sigma_used = float(np.median(pos)) if (args["sigma"] is None and pos.size) else (args["sigma"] or 1.0)
+        A = np.exp(-D_mink ** 2 / (2.0 * sigma_used ** 2))
+        np.fill_diagonal(A, 1.0)
+
         tv = total_variance_minkowski(D_mink)
     except Exception as e:
         sys.stderr.write(f"[skip] state {i}: affinity failed ({e})\n")
@@ -487,6 +650,7 @@ def _process_state(i):
         "k": None,
         "wvar": None,
         "drop": None,
+        "vdr": None,
         "r2": None,
         "ch": None,
         "sil": None,
@@ -495,7 +659,7 @@ def _process_state(i):
     }
 
     for k in range(args["k_min"], args["k_max"] + 1):
-        if X.shape[0] < k or k < 1:
+        if N_chunks < k or k < 1:
             continue
         try:
             cl = SpectralClustering(
@@ -509,29 +673,30 @@ def _process_state(i):
             sys.stderr.write(f"[warn] state {i}: spectral failed for k={k}: {e}\n")
             continue
 
-        # use Minkowski-based variance
+        # Minkowski-based variance
         wvar = weighted_incluster_variance_minkowski(D_mink, labels)
         drop = tv - wvar
         tss = tv
         bss = drop
 
-        r2 = 0.0 if tss <= 0 else (bss / tss)
+        var_drop_ratio = 0.0 if tss <= 0 else (drop / tss)
+        r2 = var_drop_ratio  # same quantity, different name
 
-        Np = X.shape[0]
+        Np = N_chunks
         ch = np.nan
         if k > 1 and Np > k and wvar > 0:
             ch = (bss / (k - 1)) / (wvar / (Np - k))
 
-        # silhouette on Euclidean
+        # silhouette on Euclidean features of whole chunks
         sil = np.nan
         try:
             if Np >= 10 and len(np.unique(labels)) > 1:
                 if args["silhouette_sample_cap"] and Np > args["silhouette_sample_cap"]:
                     rng = np.random.RandomState(args["random_state"] + i + k)
                     idx = rng.choice(Np, args["silhouette_sample_cap"], replace=False)
-                    sil = silhouette_score(X[idx], labels[idx], metric="euclidean")
+                    sil = silhouette_score(X_feat[idx], labels[idx], metric="euclidean")
                 else:
-                    sil = silhouette_score(X, labels, metric="euclidean")
+                    sil = silhouette_score(X_feat, labels, metric="euclidean")
         except Exception:
             sil = np.nan
 
@@ -541,12 +706,13 @@ def _process_state(i):
             "t_in_episode": t_in_episode,
             "task_name": task_name,
             "instruction": instruction,
-            "num_points": int(X.shape[0]),
-            "action_dim": int(X.shape[1]),
+            "num_points": int(N_chunks),
+            "action_dim": int(X_feat.shape[1]),
             "k": int(k),
             "total_variance": float(tss),
             "weighted_incluster_variance": float(wvar),
             "variance_drop": float(drop),
+            "variance_drop_ratio": float(var_drop_ratio),
             "r2": float(r2),
             "calinski_harabasz": float(ch),
             "silhouette": float(sil),
@@ -555,6 +721,7 @@ def _process_state(i):
 
         metric_value = {
             "variance_drop": drop,
+            "variance_drop_ratio": var_drop_ratio,
             "r2": r2,
             "ch": ch,
             "silhouette": sil,
@@ -568,6 +735,7 @@ def _process_state(i):
                 "k": k,
                 "wvar": wvar,
                 "drop": drop,
+                "vdr": var_drop_ratio,
                 "r2": r2,
                 "ch": ch,
                 "sil": sil,
@@ -582,12 +750,13 @@ def _process_state(i):
             "t_in_episode": t_in_episode,
             "task_name": task_name,
             "instruction": instruction,
-            "num_points": int(X.shape[0]),
-            "action_dim": int(X.shape[1]),
+            "num_points": int(N_chunks),
+            "action_dim": int(X_feat.shape[1]),
             "k": int(best["k"]),
             "total_variance": float(tv),
             "weighted_incluster_variance": float(best["wvar"]),
             "variance_drop": float(best["drop"]),
+            "variance_drop_ratio": float(best.get("vdr", 0.0)),
             "r2": float(best["r2"]),
             "calinski_harabasz": float(best["ch"]),
             "silhouette": float(best["sil"]),
@@ -595,14 +764,12 @@ def _process_state(i):
         })
         best_cache = {
             "state_index": i,
-            "labels": best["labels"],
+            "labels": best["labels"],     # per-chunk labels
             "idx": None if used_idx is None else used_idx.copy(),
             "k": int(best["k"]),
         }
 
-    # save to disk so we can resume later
     _save_state_file(state_path, rows, best_cache)
-
     return rows, best_cache
 
 
@@ -622,7 +789,8 @@ def main():
     ap.add_argument("--top_n", type=int, default=50)
     ap.add_argument("--sample_cap", type=int, default=None)
     ap.add_argument("--best_metric", type=str,
-                    choices=["variance_drop", "r2", "ch", "silhouette"], default="ch")
+                    choices=["variance_drop", "variance_drop_ratio", "r2", "ch", "silhouette"],
+                    default="variance_drop_ratio")
     ap.add_argument("--silhouette_sample_cap", type=int, default=5000)
 
     ap.add_argument("--method", type=str, choices=["minkowski", "dtw"], default="minkowski")
@@ -637,7 +805,6 @@ def main():
     ap.add_argument("--n_jobs", type=int, default=1,
                     help="Number of processes to use for per-state clustering (>=1).")
 
-    # NEW: limit how many states to process
     ap.add_argument("--max_states", type=int, default=None,
                     help="Process at most this many states (by index from 0).")
 
@@ -653,9 +820,9 @@ def main():
     N_states = len(actions_arr)
 
     if len(meta_df) != N_states:
-        sys.stderr.write(f"[warn] summary_csv rows ({len(meta_df)}) != actions entries ({N_states}); proceeding by index.\n")
+        sys.stderr.write(f"[warn] summary_csv rows ({len(meta_df)}) "
+                         f"!= actions entries ({N_states}); proceeding by index.\n")
 
-    # limit here
     if args.max_states is not None:
         N_effective = min(N_states, args.max_states)
     else:
@@ -705,10 +872,10 @@ def main():
                     best_labels_cache[best_i["state_index"]] = best_i
 
     # --------------------------------------------------
-    # Aggregation: only gather the ones we actually processed
+    # Aggregation
     # --------------------------------------------------
     all_rows = []
-    for i in range(N_effective):   # <-- use N_effective here
+    for i in range(N_effective):
         state_path = _state_file_path(per_state_dir, i)
         if not os.path.exists(state_path):
             continue
@@ -724,6 +891,7 @@ def main():
 
     sort_col = {
         "variance_drop": "variance_drop",
+        "variance_drop_ratio": "variance_drop_ratio",
         "r2": "r2",
         "ch": "calinski_harabasz",
         "silhouette": "silhouette",
@@ -740,7 +908,7 @@ def main():
     cols_to_show = [
         "state_index", "episode_id", "t_in_episode", "k", "num_points",
         "total_variance", "weighted_incluster_variance",
-        "variance_drop", "r2", "calinski_harabasz", "silhouette"
+        "variance_drop_ratio", "r2", "calinski_harabasz", "silhouette"
     ]
     print(best_df[cols_to_show].head(args.top_n).to_string(index=False))
 
@@ -756,7 +924,7 @@ def main():
     plt.close()
     print(f"\nSaved histogram: {os.path.abspath(hist_path)}")
 
-    # per-k histos
+    # per-k histos for weighted_incluster_variance + violin for variance_drop_ratio
     eval_df = metrics_df[metrics_df["best_k"] == False].copy()
     ks = sorted(eval_df["k"].unique().tolist())
     all_vals = eval_df["weighted_incluster_variance"].values
@@ -802,29 +970,44 @@ def main():
         plt.close(fig)
         print(f"Saved per-k grid histogram: {os.path.abspath(grid_path)}")
 
-        drop_overlay_path = os.path.join(args.outdir, "variance_drop_by_k_overlay.png")
-        plt.figure(figsize=(8, 6))
-        all_drop_vals = eval_df["variance_drop"].values
-        drop_bins = np.histogram_bin_edges(all_drop_vals, bins=40)
+        # Violin plot of variance-drop ratio by k
+        violin_path = os.path.join(args.outdir, "variance_drop_ratio_by_k_violin.png")
+
+        data = []
+        positions = []
+        xticklabels = []
+        pos_counter = 1
         for k in ks:
-            vals = eval_df.loc[eval_df["k"] == k, "variance_drop"].values
+            vals = eval_df.loc[eval_df["k"] == k, "variance_drop_ratio"].values
             if vals.size == 0:
                 continue
-            plt.hist(vals, bins=drop_bins, histtype="step", linewidth=1.5, label=f"k={k}")
-        plt.xlabel("Variance drop = total var - weighted in-cluster var (per specific k)")
-        plt.ylabel("Count of states")
-        plt.title("Per-k histogram of variance drop (overlay)")
-        plt.legend(frameon=False)
-        plt.tight_layout()
-        plt.savefig(drop_overlay_path, dpi=150)
-        plt.close()
-        print(f"Saved per-k variance-drop overlay: {os.path.abspath(drop_overlay_path)}")
+            data.append(vals)
+            positions.append(pos_counter)
+            xticklabels.append(f"k={k}")
+            pos_counter += 1
 
-    # ========================== Top-N visualizations ==========================
+        if data:
+            plt.figure(figsize=(max(6, 1.5 * len(positions)), 5))
+            plt.violinplot(
+                data,
+                positions=positions,
+                showmeans=True,
+                showextrema=False,
+                widths=0.8,
+            )
+            plt.xticks(positions, xticklabels)
+            plt.xlabel("Number of clusters (k)")
+            plt.ylabel("Variance drop ratio ((TV - WVAR) / TV)")
+            plt.title("Variance-drop ratio distribution by k")
+            plt.tight_layout()
+            plt.savefig(violin_path, dpi=150)
+            plt.close()
+            print(f"Saved variance-drop ratio violin plot: {os.path.abspath(violin_path)}")
+
+    # ========================== Top-N visualizations (chunk-aware) ==========================
     top_plot_dir = os.path.join(args.outdir, "top_plots")
     os.makedirs(top_plot_dir, exist_ok=True)
 
-    # we need actions_arr again here (already loaded)
     top_rows = best_df.head(args.plot_top_n).reset_index(drop=True)
     print(f"\nRendering cluster plots for top {len(top_rows)} states (by {sort_col})...")
 
@@ -835,51 +1018,88 @@ def main():
         best_k = int(row.k)
 
         acts_raw = actions_arr[state_idx]
-        if acts_raw.ndim == 3:
-            Kc, Tc, A = acts_raw.shape
-            traj_matrix = acts_raw.reshape(Kc * Tc, A)
-            index_rows = [(state_idx, k, t) for k in range(Kc) for t in range(Tc)]
-        elif acts_raw.ndim == 2:
-            Tc, A = acts_raw.shape
-            traj_matrix = acts_raw
-            index_rows = [(state_idx, 0, t) for t in range(Tc)]
+        arr = np.asarray(acts_raw)
+
+        # build per-chunk trajectories + per-point layout for plotting
+        if arr.ndim == 3:
+            Kc, Tc, A = arr.shape
+            trajectories = [arr[k] for k in range(Kc)]
+            traj_matrix = arr.reshape(Kc * Tc, A)
+            chunk_ids = np.repeat(np.arange(Kc), Tc)
+            time_ids = np.tile(np.arange(Tc), Kc)
+        elif arr.ndim == 2:
+            T, A = arr.shape
+            Kc, Tc = T, 1
+            trajectories = [arr[t:t + 1, :] for t in range(T)]
+            traj_matrix = arr.reshape(Kc * Tc, A)
+            chunk_ids = np.arange(Kc)
+            time_ids = np.zeros(Kc, dtype=int)
         else:
-            sys.stderr.write(f"[warn] Skipping state {state_idx}: unsupported shape {acts_raw.shape}\n")
+            sys.stderr.write(f"[warn] Skipping state {state_idx}: unsupported shape {arr.shape}\n")
             continue
 
-        X = traj_matrix.astype(float, copy=False)
-
         cache = best_labels_cache.get(state_idx, None)
-        if cache is None or cache.get("labels") is None:
-            # rebuild affinity & spectral once at best_k
-            A, _, _ = build_affinity_for_points(
-                X,
-                method=args.method,
-                sigma=args.sigma,
-                dtw_window=args.dtw_window,
-                random_state=args.random_state,
-                parallel_dtw=args.parallel_dtw,
-                max_workers=args.max_workers,
-            )
+
+        if cache is not None and cache.get("labels") is not None:
+            chunk_labels_cached = np.asarray(cache["labels"])
+            if cache.get("idx") is not None and len(cache["idx"]) > 0:
+                used_idx_for_plot = np.asarray(cache["idx"], dtype=int)
+                chunk_labels = chunk_labels_cached
+            else:
+                used_idx_for_plot = None
+                chunk_labels = chunk_labels_cached
+        else:
+            if args.method == "minkowski":
+                D_mink = compute_minkowski_distance_matrix(trajectories)
+            else:
+                D_mink = compute_dtw_matrix(
+                    trajectories,
+                    window=args.dtw_window,
+                    parallelize=args.parallel_dtw,
+                    max_workers=args.max_workers,
+                )
+            pos = D_mink[D_mink > 0]
+            sigma_used = float(np.median(pos)) if (args.sigma is None and pos.size) else (args.sigma or 1.0)
+            A_plot = np.exp(-D_mink ** 2 / (2.0 * sigma_used ** 2))
+            np.fill_diagonal(A_plot, 1.0)
+
             cl = SpectralClustering(
                 n_clusters=best_k,
                 affinity="precomputed",
                 assign_labels="kmeans",
                 random_state=args.random_state,
             )
-            labels_for_plot = cl.fit_predict(A)
+            chunk_labels = cl.fit_predict(A_plot)
             used_idx_for_plot = None
-        else:
-            labels_for_plot = cache["labels"]
-            if cache["idx"] is not None:
-                used_idx_for_plot = cache["idx"]
-                X = X[used_idx_for_plot]
-                index_rows = [index_rows[j] for j in used_idx_for_plot.tolist()]
-            else:
-                used_idx_for_plot = None
 
-        xyz = to_xyz(X, mode=args.ee_mode)
-        sub = os.path.join(top_plot_dir, f"rank{rank + 1:02d}_ep{ep_id}_state_{t_in_ep:06d}")
+        # map chunk-level labels -> per-point labels
+        if used_idx_for_plot is None:
+            labels_per_point = chunk_labels[chunk_ids]
+            traj_matrix_plot = traj_matrix
+            chunk_ids_plot = chunk_ids
+            time_ids_plot = time_ids
+        else:
+            chunk_label_for_orig = np.full(Kc, -1, dtype=int)
+            for local_idx, orig_idx in enumerate(used_idx_for_plot):
+                chunk_label_for_orig[orig_idx] = chunk_labels[local_idx]
+
+            mask = chunk_label_for_orig[chunk_ids] >= 0
+            if not np.any(mask):
+                sys.stderr.write(f"[warn] No points to plot for state {state_idx} after applying used_idx.\n")
+                continue
+
+            traj_matrix_plot = traj_matrix[mask]
+            chunk_ids_plot = chunk_ids[mask]
+            time_ids_plot = time_ids[mask]
+            labels_per_point = chunk_label_for_orig[chunk_ids_plot]
+
+        xyz = to_xyz(traj_matrix_plot, mode=args.ee_mode)
+        index_rows = [
+            (state_idx, int(c), int(t))
+            for c, t in zip(chunk_ids_plot, time_ids_plot)
+        ]
+
+        sub = os.path.join(top_plot_dir, f"rank{rank + 1:02d}_{ep_id}_state_{t_in_ep:06d}")
         os.makedirs(sub, exist_ok=True)
 
         title = (f"ep={ep_id} state={t_in_ep} | best-k={best_k} | "
@@ -888,22 +1108,29 @@ def main():
         percluster_png = os.path.join(sub, "percluster.png")
 
         plot_actions_xyz(
-            xyz, labels_for_plot, index_rows,
+            xyz, labels_per_point, index_rows,
             png_path=overview_png, title=title,
             point_size=1, line_width=1.0, line_alpha=0.4,
             line_color_mode="by_dominant_cluster",
         )
-        n_cls = len(np.unique(labels_for_plot))
+
+        n_cls = len(np.unique(labels_per_point))
         plot_per_cluster_panels(
-            xyz, labels_for_plot, index_rows, n_clusters=n_cls,
+            xyz, labels_per_point, index_rows, n_clusters=n_cls,
             png_path=percluster_png, title_prefix=f"ep={ep_id} state={t_in_ep}",
             point_size=1, line_width=1.2, line_alpha=0.55,
         )
 
-        idx_to_save = np.array([], dtype=int) if used_idx_for_plot is None else used_idx_for_plot
+        if used_idx_for_plot is None:
+            idx_to_save = np.array([], dtype=int)
+        else:
+            idx_to_save = used_idx_for_plot.astype(int, copy=False)
+
         np.savez_compressed(
             os.path.join(args.outdir, f"best_labels_state_{state_idx:06d}.npz"),
-            labels=labels_for_plot, idx=idx_to_save, k=best_k,
+            labels=np.asarray(chunk_labels, dtype=int),
+            idx=idx_to_save,
+            k=best_k,
         )
 
     print(f"Top-N plots written under: {os.path.abspath(top_plot_dir)}")

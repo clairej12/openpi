@@ -3,39 +3,150 @@
 postprocess_gaussian_threshold.py
 
 Read the clustered/metric outputs from the main spectral script and filter
-(state, k) combinations whose variance_drop beats a Gaussian baseline
-(for the same N, d, k). Then visualize the first N passes using the same
-3D plots as the clustering script.
+(state, k) combinations whose variance_drop_ratio beats a Gaussian baseline
+(for the same (num_points, action_dim, k) and matched trajectory structure).
 
 Assumptions:
 - You already ran the main script and you have:
     outdir/metrics_per_state.csv
     outdir/per_state/state_000000.npz  (etc.)
     actions_npz  (same one used for clustering)
+
 - Per-state npz files contain: rows (list of dicts) and best (dict) – as in your script.
 
 We:
 1) load metrics
-2) compute Gaussian baselines per (num_points, action_dim, k)
-3) apply threshold: actual_drop >= multiplier * baseline_drop
-4) save passing rows
-5) replot first --plot_pass_top of them
+2) compute Gaussian *reference* baselines per (num_points, action_dim, k),
+   using synthetic trajectory "chunks" constructed as:
+       w ~ N(0, I_A), a_t = (t / (T-1)) * w,  t = 0..T-1
+   where T and A are inferred from a real state's actions with that combo.
+   We then run Minkowski + spectral clustering on these Gaussian chunks and
+   compute the average variance_drop_ratio = (tv - wvar) / tv.
+3) compute variance_drop_ratio for the real states
+4) apply threshold: ratio_actual >= multiplier * ratio_baseline
+5) save passing rows
+6) produce:
+   - per-k violin plots of variance_drop_ratio by path type, with baseline ratio
+   - Plotly 3D interactive visualizations for the first --plot_pass_top passes
 """
 
-import argparse, os, sys
+import argparse
+import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib
 
 from sklearn.cluster import SpectralClustering
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist
 
-# ------------------------------------------------------------
-# plotting helpers (borrowed from your clustering script)
-# ------------------------------------------------------------
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
+
+# ------------------------------------------------------------
+# Minkowski distance & variance helpers (chunk-based)
+# ------------------------------------------------------------
+
+def _as_2d(x):
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x.reshape(-1, 1).astype(float, copy=False)
+    if x.ndim >= 3:
+        x = x.reshape(x.shape[0], -1)
+    return x.astype(float, copy=False)
+
+
+def symmetrized_l2_minkowski_traj(X, Y):
+    """
+    Trajectory-level distance between X and Y.
+
+    X: (T_x, A)
+    Y: (T_y, A)
+
+    d1^2 = sum_i min_j ||x_i - y_j||^2
+    d2^2 = sum_j min_i ||y_j - x_i||^2
+    d   = sqrt( (d1^2 + d2^2) / 2 )
+    """
+    X = _as_2d(X)
+    Y = _as_2d(Y)
+    if X.shape[0] == 0 and Y.shape[0] == 0:
+        return 0.0
+    if X.shape[0] == 0 or Y.shape[0] == 0:
+        return np.inf
+
+    dists_sq = cdist(X, Y, metric="sqeuclidean")  # (T_x, T_y)
+    d1_sq = np.sum(np.min(dists_sq, axis=1))      # sum_i min_j ||x_i - y_j||^2
+    d2_sq = np.sum(np.min(dists_sq, axis=0))      # sum_j min_i ||y_j - x_i||^2
+    return float(np.sqrt(0.5 * (d1_sq + d2_sq)))
+
+
+def compute_minkowski_distance_matrix(trajectories):
+    """
+    trajectories: list of arrays, each (T_i, A) = one action chunk (trajectory).
+    Returns D[i,j] = symmetrized_l2_minkowski_traj(traj_i, traj_j).
+    """
+    N = len(trajectories)
+    D = np.zeros((N, N), dtype=float)
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = symmetrized_l2_minkowski_traj(trajectories[i], trajectories[j])
+            D[i, j] = D[j, i] = d
+    return D
+
+
+def _minkowski_variance_from_D(D):
+    """
+    D: (N, N) array of symmetrized Minkowski distances between chunks.
+    Implements:
+      Var := E[d^2] + 2 (E[d])^2 - 2 E_x[ (E_{x'}[d(x,x')])^2 ]
+    where expectations are empirical over the N chunks.
+    """
+    D = np.asarray(D, float)
+    if D.size == 0:
+        return 0.0
+    term1 = float(np.mean(D ** 2))          # E[d^2]
+    mean_d = float(np.mean(D))             # E[d]
+    row_means = D.mean(axis=1)             # E_{x'}[d(x,x')]
+    term3 = float(np.mean(row_means ** 2)) # E_x[(E_{x'}[d])^2]
+    # return term1 + 2.0 * (mean_d ** 2) - 2.0 * term3
+    return 0.5 * term1
+
+
+def total_variance_minkowski(D):
+    """Total variance of the set of action chunks, in Minkowski distance space."""
+    return _minkowski_variance_from_D(D)
+
+
+def weighted_incluster_variance_minkowski(D, labels):
+    """
+    D: (N, N) Minkowski distance matrix between chunks.
+    labels: cluster labels per chunk (length N).
+
+    Computes size-weighted average of cluster variances, with variance
+    defined via _minkowski_variance_from_D on each cluster submatrix.
+    """
+    labels = np.asarray(labels)
+    N = D.shape[0]
+    if N == 0:
+        return 0.0
+
+    wvar = 0.0
+    for c in np.unique(labels):
+        idx = np.where(labels == c)[0]
+        if idx.size == 0:
+            continue
+        Dc = D[np.ix_(idx, idx)]
+        var_c = _minkowski_variance_from_D(Dc)
+        wvar += (idx.size / N) * var_c
+    return float(wvar)
+
+
+# ------------------------------------------------------------
+# Plotly-based 3D plotting helpers
+# ------------------------------------------------------------
 
 def to_xyz(actions, mode="first3", pca_model=None, kinematic_map=None):
     X = np.asarray(actions, dtype=float)
@@ -48,7 +159,7 @@ def to_xyz(actions, mode="first3", pca_model=None, kinematic_map=None):
         if kinematic_map is None:
             raise ValueError("custom mode requires kinematic_map")
         return np.asarray(kinematic_map(X), dtype=float)
-    else:  # pca
+    else:  # "pca"
         if pca_model is None:
             pca_model = PCA(n_components=3, random_state=0)
             Z = pca_model.fit_transform(X)
@@ -56,97 +167,145 @@ def to_xyz(actions, mode="first3", pca_model=None, kinematic_map=None):
             Z = pca_model.transform(X)
         return Z
 
+viridis = matplotlib.colormaps.get_cmap("viridis")
+def cval_to_hex(cval):
+    r, g, b, _ = viridis(cval)
+    return f"rgb({int(r*255)}, {int(g*255)}, {int(b*255)})"
 
-def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
-                     point_size=1, line_width=1.0, line_alpha=0.6,
-                     line_color_mode="by_dominant_cluster",
-                     start_marker_size=10, end_marker_size=20):
-    import matplotlib.lines as mlines
-    fig = plt.figure(figsize=(7, 6))
-    ax = fig.add_subplot(111, projection="3d")
+def plot_actions_xyz(xyz, labels, index_rows, html_path="", title="",
+                     point_size=2, line_width=4.0, line_alpha=0.6):
+    """
+    Plotly 3D scatter + trajectory lines for all points,
+    with chunk lines + endpoints colored by the cluster they belong to.
+    """
     xyz = np.asarray(xyz)
     labels = np.asarray(labels).reshape(-1)
     if labels.shape[0] != xyz.shape[0]:
         raise ValueError("labels length mismatch")
-    scatter = ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=labels,
-                         s=point_size, alpha=0.95)
-    start_h = end_h = None
-    if index_rows is not None and len(index_rows) == xyz.shape[0]:
-        sample_idx = np.array([r[1] for r in index_rows], dtype=int)
-        action_idx = np.array([r[2] for r in index_rows], dtype=int)
-        unique_samples = np.unique(sample_idx)
-        for s in unique_samples:
-            m = (sample_idx == s)
-            order = np.argsort(action_idx[m])
-            pts = xyz[m][order]
-            labs = labels[m][order]
-            if pts.shape[0] >= 2:
-                if line_color_mode == "by_dominant_cluster":
-                    vals, counts = np.unique(labs, return_counts=True)
-                    dom = vals[np.argmax(counts)]
-                    line_color = scatter.cmap(scatter.norm(dom))
-                else:
-                    line_color = "k"
-                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2],
-                        linewidth=line_width, alpha=line_alpha, color=line_color)
-            p0, p1 = pts[0], pts[-1]
-            ax.scatter([p0[0]], [p0[1]], [p0[2]], s=start_marker_size,
-                       c="none", edgecolor="k", linewidths=1.0, marker="o")
-            ax.scatter([p1[0]], [p1[1]], [p1[2]], s=end_marker_size, c="k",
-                       marker="x", linewidths=1.5)
-        start_h = mlines.Line2D([], [], color="k", marker="o", markersize=6,
-                                markerfacecolor="none", linestyle="None", label="chunk start")
-        end_h = mlines.Line2D([], [], color="k", marker="x", markersize=7,
-                              linestyle="None", label="chunk end")
-    legend_items = [mlines.Line2D([], [], color=scatter.cmap(scatter.norm(lab)),
-                                  marker="s", linestyle="None", markersize=6,
-                                  label=f"cluster {lab}") for lab in np.unique(labels)]
-    if start_h is not None:
-        legend_items.append(start_h)
-    if end_h is not None:
-        legend_items.append(end_h)
-    if legend_items:
-        ax.legend(handles=legend_items, loc="best", frameon=False, fontsize=9)
-    ax.set_title(title)
-    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
-    # equal-ish axes
-    x_limits = ax.get_xlim3d(); y_limits = ax.get_ylim3d(); z_limits = ax.get_zlim3d()
-    x_range = abs(x_limits[1] - x_limits[0])
-    y_range = abs(y_limits[1] - y_limits[0])
-    z_range = abs(z_limits[1] - z_limits[0])
-    max_range = max([x_range, y_range, z_range])
-    xm, ym, zm = np.mean(x_limits), np.mean(y_limits), np.mean(z_limits)
-    ax.set_xlim3d([xm - max_range / 2, xm + max_range / 2])
-    ax.set_ylim3d([ym - max_range / 2, ym + max_range / 2])
-    ax.set_zlim3d([zm - max_range / 2, zm + max_range / 2])
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=150)
-    plt.close(fig)
+    if index_rows is None or len(index_rows) != xyz.shape[0]:
+        raise ValueError("index_rows length mismatch with xyz")
 
+    sample_idx = np.array([r[1] for r in index_rows], dtype=int)
+    action_idx = np.array([r[2] for r in index_rows], dtype=int)
+
+    # Consistent color map
+    uniq = np.unique(labels)
+    uniq_sorted = np.sort(uniq)
+    color_map = {lab: i / max(1, len(uniq_sorted)-1) for i, lab in enumerate(uniq_sorted)}
+    # These remain normalized [0,1], Plotly Viridis will interpret automatically
+
+    fig = go.Figure()
+
+    # --- main scatter ---
+    fig.add_trace(go.Scatter3d(
+        x=xyz[:, 0],
+        y=xyz[:, 1],
+        z=xyz[:, 2],
+        mode="markers",
+        marker=dict(
+            size=point_size,
+            color=[color_map[l] for l in labels],
+            colorscale="Viridis",
+            showscale=True,
+        ),
+        name="points",
+        opacity=0.95,
+    ))
+
+    # --- chunk-level trajectories ---
+    for s in np.unique(sample_idx):
+        m = (sample_idx == s)
+        order = np.argsort(action_idx[m])
+        pts = xyz[m][order]
+        labs = labels[m][order]
+
+        if pts.shape[0] < 2:
+            continue
+
+        # dominant cluster
+        vals, counts = np.unique(labs, return_counts=True)
+        dom = vals[np.argmax(counts)]
+        cval = color_map[dom]
+        color_hex = cval_to_hex(cval)
+
+        # trajectory line
+        fig.add_trace(go.Scatter3d(
+            x=pts[:, 0],
+            y=pts[:, 1],
+            z=pts[:, 2],
+            mode="lines",
+            line=dict(
+                width=line_width,
+                color=color_hex,     # exact cluster color
+            ),
+            opacity=line_alpha,
+            showlegend=False,
+        ))
+
+        # start marker
+        p0 = pts[0]
+        fig.add_trace(go.Scatter3d(
+            x=[p0[0]], y=[p0[1]], z=[p0[2]],
+            mode="markers",
+            marker=dict(
+                symbol="circle-open",
+                size=3,
+                line=dict(width=2, color=color_hex),
+                color=color_hex,
+            ),
+            showlegend=False,
+        ))
+
+        # end marker
+        p1 = pts[-1]
+        fig.add_trace(go.Scatter3d(
+            x=[p1[0]], y=[p1[1]], z=[p1[2]],
+            mode="markers",
+            marker=dict(
+                symbol="x",
+                size=3,
+                color=color_hex,
+            ),
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+
+    fig.write_html(html_path)
 
 def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters,
-                            png_path, title_prefix="State",
-                            point_size=3, line_width=1.0, line_alpha=0.6):
-    import matplotlib.lines as mlines
+                            html_path, title_prefix="State",
+                            point_size=2, line_width=4.0, line_alpha=0.6):
+    """
+    Plotly multi-panel (subplots) 3D visualization: one scene per cluster.
+    """
     xyz = np.asarray(xyz)
     labels = np.asarray(per_point_labels).reshape(-1)
     assert xyz.shape[0] == labels.shape[0] == len(index_rows)
+
     sample_idx = np.array([r[1] for r in index_rows], dtype=int)
     action_idx = np.array([r[2] for r in index_rows], dtype=int)
+
     uniq_clusters = np.unique(labels)
     C = int(max(n_clusters, uniq_clusters.max() + 1))
-    cols = min(C, 4)
-    rows = int(np.ceil(C / cols))
-    fig = plt.figure(figsize=(5 * cols, 4.5 * rows))
 
-    def _equal(ax):
-        xlim = ax.get_xlim3d(); ylim = ax.get_ylim3d(); zlim = ax.get_zlim3d()
-        xr = abs(xlim[1] - xlim[0]); yr = abs(ylim[1] - ylim[0]); zr = abs(zlim[1] - zlim[0])
-        mr = max(xr, yr, zr)
-        xm = np.mean(xlim); ym = np.mean(ylim); zm = np.mean(zlim)
-        ax.set_xlim3d([xm - mr / 2, xm + mr / 2])
-        ax.set_ylim3d([ym - mr / 2, ym + mr / 2])
-        ax.set_zlim3d([zm - mr / 2, zm + mr / 2])
+    cols = min(4, C)
+    rows = int(np.ceil(C / cols))
+
+    fig = make_subplots(
+        rows=rows,
+        cols=cols,
+        specs=[[{"type": "scene"} for _ in range(cols)] for _ in range(rows)],
+        subplot_titles=[f"Cluster {ci}" for ci in range(C)],
+    )
 
     # assign each chunk to its dominant cluster
     chunk_ids = np.unique(sample_idx)
@@ -159,60 +318,86 @@ def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters,
         chunk_to_cluster[k] = int(vals[np.argmax(counts)])
 
     for ci in range(C):
-        ax = fig.add_subplot(rows, cols, ci + 1, projection="3d")
-        ax.set_title(f"Cluster {ci}")
-        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+        row_i = ci // cols + 1
+        col_i = ci % cols + 1
         chunks_in_ci = [k for k, lab in chunk_to_cluster.items() if lab == ci]
         if not chunks_in_ci:
-            ax.text(0.5, 0.5, 0.5, "No chunks", transform=ax.transAxes,
-                    ha="center", va="center")
             continue
+
         for k in chunks_in_ci:
             m = (sample_idx == k)
             pts = xyz[m]
-            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size, alpha=0.95)
-        for k in chunks_in_ci:
-            m = (sample_idx == k)
-            order = np.argsort(action_idx[m])
-            pts = xyz[m][order]
+            t_ids = action_idx[m]
+            order = np.argsort(t_ids)
+            pts = pts[order]
+            if pts.shape[0] == 0:
+                continue
+
+            # points
+            fig.add_trace(
+                go.Scatter3d(
+                    x=pts[:, 0],
+                    y=pts[:, 1],
+                    z=pts[:, 2],
+                    mode="markers",
+                    marker=dict(size=point_size),
+                    opacity=0.95,
+                    showlegend=False,
+                ),
+                row=row_i,
+                col=col_i,
+            )
+
+            # line
             if pts.shape[0] >= 2:
-                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2],
-                        linewidth=line_width, alpha=line_alpha)
-            p0, p1 = pts[0], pts[-1]
-            ax.scatter([p0[0]], [p0[1]], [p0[2]], s=36, c="none",
-                       edgecolor="k", linewidths=1.0, marker="o")
-            ax.scatter([p1[0]], [p1[1]], [p1[2]], s=48, c="k",
-                       marker="x", linewidths=1.5)
-        _equal(ax)
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=pts[:, 0],
+                        y=pts[:, 1],
+                        z=pts[:, 2],
+                        mode="lines",
+                        line=dict(width=line_width),
+                        opacity=line_alpha,
+                        showlegend=False,
+                    ),
+                    row=row_i,
+                    col=col_i,
+                )
 
-    start_h = mlines.Line2D([], [], color="k", marker="o", markersize=6,
-                            markerfacecolor="none", linestyle="None", label="chunk start")
-    end_h = mlines.Line2D([], [], color="k", marker="x", markersize=7,
-                          linestyle="None", label="chunk end")
-    fig.legend(handles=[start_h, end_h], loc="upper right", frameon=False)
-    fig.suptitle(f"{title_prefix}: per-cluster chunk views", y=0.995)
-    fig.tight_layout(rect=[0, 0.00, 1, 0.96])
-    fig.savefig(png_path, dpi=150)
-    plt.close(fig)
+            # start / end markers
+            p0 = pts[0]
+            p1 = pts[-1]
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[p0[0]],
+                    y=[p0[1]],
+                    z=[p0[2]],
+                    mode="markers",
+                    marker=dict(symbol="circle-open", size=3, line=dict(width=1)),
+                    showlegend=False,
+                ),
+                row=row_i,
+                col=col_i,
+            )
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[p1[0]],
+                    y=[p1[1]],
+                    z=[p1[2]],
+                    mode="markers",
+                    marker=dict(symbol="x", size=3),
+                    showlegend=False,
+                ),
+                row=row_i,
+                col=col_i,
+            )
 
+    fig.update_layout(
+        title=f"{title_prefix}: per-cluster chunk views",
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
 
-# ------------------------------------------------------------
-# helper to rebuild affinity (same logic as main script)
-# ------------------------------------------------------------
-def build_affinity_for_points(X, method="minkowski", sigma=None,
-                              dtw_window=None, random_state=0,
-                              parallel_dtw=False, max_workers=None):
-    X = np.asarray(X, dtype=float)
-    N = X.shape[0]
-    if method == "minkowski":
-        D = cdist(X, X, metric="euclidean")
-        pos = D[D > 0]
-        sigma_used = float(np.median(pos)) if (sigma is None and pos.size) else (sigma or 1.0)
-        A = np.exp(-D ** 2 / (2 * sigma_used ** 2))
-        np.fill_diagonal(A, 1.0)
-        return A, D, sigma_used
-    # if someone passes dtw here, we could add it, but for plotting top 10 it's fine
-    raise NotImplementedError("DTW branch not wired for postprocess script")
+    fig.write_html(html_path)
 
 
 # ------------------------------------------------------------
@@ -224,76 +409,87 @@ def load_per_state_file(path):
     best = None
     if "best" in data and data["best"].size > 0:
         first = data["best"][0]
-        # depending on how it was saved, first is either dict or 0d object
         if isinstance(first, dict):
             best = first
-        else:  # numpy object scalar
+        else:
             best = first.item()
     return rows, best
 
 
 # ------------------------------------------------------------
-# Gaussian baseline for arbitrary k (including non powers of 2)
+# Gaussian *trajectory* baseline for ratio
 # ------------------------------------------------------------
-def gaussian_baseline_drop(num_points, action_dim, k,
-                           n_trials=30, max_points_sim=3000, rng=None):
+def gaussian_baseline_ratio(num_chunks,
+                            per_step_dim,
+                            chunk_len,
+                            k,
+                            n_trials=30,
+                            rng=None,
+                            sigma=None):
     """
     For each trial:
-      - sample N x d from N(0, I)
-      - recursively split the cluster with the largest variance (by dim)
-        until we get k clusters (works for k=4,5,6,...)
-      - compute variance_drop := global_var - weighted_cluster_var
-    Return the average variance_drop over trials.
+      - Generate num_chunks synthetic trajectories (chunks) of length chunk_len in R^{per_step_dim}:
+            w ~ N(0, I)
+            a_t = (t / (chunk_len - 1)) * w,   t = 0..chunk_len-1
+        (if chunk_len == 1, use just w as a single step)
+      - Compute Minkowski distance matrix between chunks
+      - Compute total variance tv
+      - Build Gaussian affinity from D using the same median-sigma logic
+      - Run spectral clustering with n_clusters = k
+      - Compute weighted in-cluster variance wvar
+      - Compute variance_drop_ratio = (tv - wvar) / tv
+    Return the average variance_drop_ratio over trials.
     """
     if rng is None:
         rng = np.random.RandomState(0)
-    N = min(num_points, max_points_sim)
-    drops = []
+
+    ratios = []
     for _ in range(n_trials):
-        X = rng.randn(N, action_dim)
-        clusters = [X]
-        # keep splitting the noisiest cluster until we have k
-        while len(clusters) < k:
-            # pick cluster with largest mean variance
-            vars_ = [c.var(axis=0).mean() for c in clusters]
-            idx = int(np.argmax(vars_))
-            C = clusters.pop(idx)
-            if C.shape[0] <= 1:
-                # can't split, put it back and break
-                clusters.append(C)
-                break
-            # split along dim with biggest variance
-            dim = int(np.argmax(C.var(axis=0)))
-            thr = np.median(C[:, dim])
-            left = C[C[:, dim] <= thr]
-            right = C[C[:, dim] > thr]
-            if left.size == 0 or right.size == 0:
-                # fallback: random split
-                perm = rng.permutation(C.shape[0])
-                m = C.shape[0] // 2
-                left = C[perm[:m]]
-                right = C[perm[m:]]
-            clusters.append(left)
-            clusters.append(right)
-            # if we overshot (rare), merge two smallest
-            if len(clusters) > k:
-                sizes = [c.shape[0] for c in clusters]
-                a = int(np.argmin(sizes))
-                tmp = clusters.pop(a)
-                b = int(np.argmin([c.shape[0] for c in clusters]))
-                other = clusters.pop(b)
-                merged = np.vstack([tmp, other])
-                clusters.append(merged)
-        global_var = X.var(axis=0).mean()
-        within = 0.0
-        for c in clusters:
-            if c.shape[0] == 0:
-                continue
-            var_c = c.var(axis=0).mean()
-            within += (c.shape[0] / N) * var_c
-        drop = global_var - within
-        drops.append(drop)
-    return float(np.mean(drops))
+        trajectories = []
+        # build synthetic Gaussian trajectories
+        for _c in range(num_chunks):
+            w = rng.randn(per_step_dim)
+            if chunk_len <= 1:
+                traj = w.reshape(1, per_step_dim)
+            else:
+                t_grid = np.arange(chunk_len, dtype=float)
+                t_grid = t_grid / max(chunk_len - 1, 1.0)
+                traj = (t_grid[:, None] * w[None, :])
+            trajectories.append(traj)
+
+        # Minkowski distance matrix
+        D_mink = compute_minkowski_distance_matrix(trajectories)
+        tv = total_variance_minkowski(D_mink)
+        if tv <= 0:
+            continue
+
+        # build affinity from D_mink
+        pos = D_mink[D_mink > 0]
+        sigma_used = float(np.median(pos)) if (sigma is None and pos.size) else (sigma or 1.0)
+        A = np.exp(-D_mink ** 2 / (2.0 * sigma_used ** 2))
+        np.fill_diagonal(A, 1.0)
+
+        if num_chunks < k or k < 1:
+            continue
+        try:
+            cl = SpectralClustering(
+                n_clusters=k,
+                affinity="precomputed",
+                assign_labels="kmeans",
+                random_state=0,
+            )
+            labels = cl.fit_predict(A)
+        except Exception:
+            continue
+
+        wvar = weighted_incluster_variance_minkowski(D_mink, labels)
+        drop = tv - wvar
+        if tv > 0:
+            ratios.append(drop / tv)
+
+    if not ratios:
+        return 0.0
+    return float(np.mean(ratios))
 
 
 # ------------------------------------------------------------
@@ -311,15 +507,13 @@ def main():
                     help="directory containing per_state/*.npz; "
                          "defaults to dirname(metrics_csv)/per_state")
     ap.add_argument("--gaussian_trials", type=int, default=30)
-    ap.add_argument("--gaussian_max_points", type=int, default=3000)
-    ap.add_argument("--gaussian_multiplier", type=float, default=0.5,
-                    help="threshold = multiplier * gaussian_baseline_drop")
+    ap.add_argument("--gaussian_max_points", type=int, default=3000)  # kept for API compatibility, not used now
+    ap.add_argument("--gaussian_multiplier", type=float, default=1.0,
+                    help="threshold = multiplier * gaussian_baseline_ratio")
     ap.add_argument("--plot_pass_top", type=int, default=10,
                     help="visualize first N passing rows")
-    ap.add_argument("--method", type=str, default="minkowski",
-                    choices=["minkowski"],
-                    help="used only when we have to recluster a non-best-k")
-    ap.add_argument("--sigma", type=float, default=None)
+    ap.add_argument("--sigma", type=float, default=None,
+                    help="sigma for RBF kernel; if None, use median heuristic")
     ap.add_argument("--ee_mode", type=str, default="first3",
                     choices=["first3", "pca", "custom"])
     args = ap.parse_args()
@@ -332,46 +526,91 @@ def main():
     actions_data = np.load(args.actions_npz, allow_pickle=True)
     actions_arr = actions_data["actions"]
 
-    # collect unique (N, d, k)
-    combos = set()
+    # --------------------------------------------------------
+    # Compute real variance_drop_ratio for all rows
+    # --------------------------------------------------------
+    tv = metrics_df["total_variance"].to_numpy()
+    vd = metrics_df["variance_drop"].to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(tv > 0, vd / tv, np.nan)
+    metrics_df["variance_drop_ratio"] = ratio
+
+    # --------------------------------------------------------
+    # Build (num_points, action_dim, k) -> (chunk_len, per_step_dim)
+    # using a representative state for each combo
+    # --------------------------------------------------------
+    combo_to_params = {}
     for _, row in metrics_df.iterrows():
         Np = int(row["num_points"])
         d = int(row["action_dim"])
         k = int(row["k"])
-        combos.add((Np, d, k))
+        state_idx = int(row["state_index"])
+        key = (Np, d, k)
+        if key in combo_to_params:
+            continue
 
-    print(f"Found {len(combos)} unique (num_points, action_dim, k) combos for Gaussian baseline")
+        arr = np.asarray(actions_arr[state_idx])
+        if arr.ndim == 3:
+            # (Kc, Tc, A)
+            Kc, Tc, A = arr.shape
+            chunk_len = Tc
+            per_step_dim = A
+        elif arr.ndim == 2:
+            # (T, A); in the main script, each time step is a 1-step trajectory
+            T, A = arr.shape
+            chunk_len = 1
+            per_step_dim = A
+        else:
+            sys.stderr.write(
+                f"[warn] state {state_idx}: unsupported action shape {arr.shape}; "
+                "skipping this combo for baseline.\n"
+            )
+            continue
+
+        combo_to_params[key] = (chunk_len, per_step_dim)
+
+    print(f"Found {len(combo_to_params)} unique (num_points, action_dim, k) combos for Gaussian baseline")
 
     rng = np.random.RandomState(0)
-    combo_to_baseline = {}
-    for (Np, d, k) in combos:
-        base = gaussian_baseline_drop(
-            Np,
-            d,
-            k,
-            n_trials=args.gaussian_trials,
-            max_points_sim=args.gaussian_max_points,
-            rng=rng,
-        )
-        combo_to_baseline[(Np, d, k)] = base
+    combo_to_baseline_ratio = {}
 
-    # apply threshold
+    # --------------------------------------------------------
+    # Compute Gaussian baseline variance_drop_ratio per combo
+    # --------------------------------------------------------
+    for (Np, d, k), (chunk_len, per_step_dim) in combo_to_params.items():
+        base_ratio = gaussian_baseline_ratio(
+            num_chunks=Np,
+            per_step_dim=per_step_dim,
+            chunk_len=chunk_len,
+            k=k,
+            n_trials=args.gaussian_trials,
+            rng=rng,
+            sigma=args.sigma,
+        )
+        combo_to_baseline_ratio[(Np, d, k)] = base_ratio
+
+    # --------------------------------------------------------
+    # Apply threshold using variance_drop_ratio
+    # --------------------------------------------------------
     baseline_list = []
     pass_mask = []
-    for _, row in metrics_df.iterrows():
+    ratios = metrics_df["variance_drop_ratio"].to_numpy()
+
+    for idx, row in metrics_df.iterrows():
         key = (int(row["num_points"]), int(row["action_dim"]), int(row["k"]))
-        base = combo_to_baseline[key]
-        baseline_list.append(base)
-        actual = float(row["variance_drop"])
-        passes = actual >= args.gaussian_multiplier * base
+        base_ratio = combo_to_baseline_ratio.get(key, 0.0)
+        baseline_list.append(base_ratio)
+        actual_ratio = ratios[idx]
+        passes = (not np.isnan(actual_ratio)) and (actual_ratio >= args.gaussian_multiplier * base_ratio)
         pass_mask.append(passes)
-    metrics_df["gaussian_baseline_drop"] = baseline_list
+
+    metrics_df["gaussian_baseline_ratio"] = baseline_list
     metrics_df["pass_gaussian"] = pass_mask
 
     pass_df = metrics_df[metrics_df["pass_gaussian"] == True].copy()  # noqa: E712
-    # sort by "how much it beats" the threshold
-    pass_df["beat_margin"] = pass_df["variance_drop"] - \
-        (args.gaussian_multiplier * pass_df["gaussian_baseline_drop"])
+    # sort by "how much it beats" the threshold (in ratio space)
+    pass_df["beat_margin"] = pass_df["variance_drop_ratio"] - \
+        (args.gaussian_multiplier * pass_df["gaussian_baseline_ratio"])
     pass_df.sort_values("beat_margin", ascending=False, inplace=True)
 
     pass_csv = os.path.join(args.outdir, "gaussian_passes.csv")
@@ -381,7 +620,91 @@ def main():
     print(f"{len(pass_df)} state+k rows passed the Gaussian-based threshold.")
 
     # --------------------------------------------------------
-    # visualize first N passes
+    # Aggregated violin plots: variance_drop_ratio by path type per k
+    # --------------------------------------------------------
+
+    # Choose a source column for path type
+    # Prefer non-empty task_name; otherwise fall back to instruction
+    def _choose_name(row):
+        tn = row.get("task_name", "")
+        if isinstance(tn, str) and tn.strip():
+            return tn
+        instr = row.get("instruction", "")
+        if isinstance(instr, str) and instr.strip():
+            return instr
+        return ""
+
+    def _get_path_type_from_row(row):
+        name = _choose_name(row)
+        s = name.strip()
+        if not s:
+            return "unknown"
+        return s.split()[0]
+
+    # Add path_type column to both full metrics and passes
+    metrics_df["path_type"] = metrics_df.apply(_get_path_type_from_row, axis=1)
+    pass_df["path_type"] = pass_df.apply(_get_path_type_from_row, axis=1)
+
+    violin_dir = os.path.join(args.outdir, "gaussian_task_violins")
+    os.makedirs(violin_dir, exist_ok=True)
+
+    unique_ks = sorted(metrics_df["k"].unique().tolist())
+    for k_val in unique_ks:
+        # rows that passed Gaussian threshold for this k
+        pass_k = pass_df[pass_df["k"] == k_val]
+        if pass_k.empty:
+            continue
+
+        path_types = sorted(pass_k["path_type"].unique().tolist())
+        if not path_types:
+            continue
+
+        # collect variance_drop_ratio distributions per path type
+        data = []
+        labels_pt = []
+        for pt in path_types:
+            vals = pass_k.loc[pass_k["path_type"] == pt, "variance_drop_ratio"].dropna().values
+            if vals.size == 0:
+                continue
+            data.append(vals)
+            labels_pt.append(pt)
+
+        if not data:
+            continue
+
+        metrics_k = metrics_df[metrics_df["k"] == k_val]
+        if metrics_k.empty:
+            baseline_mean = float("nan")
+        else:
+            baseline_mean = float(metrics_k["gaussian_baseline_ratio"].mean())
+
+        x_positions = np.arange(1, len(labels_pt) + 1)
+
+        plt.figure(figsize=(max(7, 0.8 * len(labels_pt)), 5))
+        vp = plt.violinplot(data, positions=x_positions, showmeans=False, showmedians=True, showextrema=True)
+
+        plt.xticks(x_positions, labels_pt, rotation=45, ha="right")
+        plt.ylabel("Variance drop ratio (passing rows)")
+        plt.xlabel("Path type (first word of task_name/instruction)")
+        plt.title(f"Variance drop ratio by path type | k={k_val}")
+
+        if not np.isnan(baseline_mean):
+            plt.axhline(
+                baseline_mean,
+                linestyle="--",
+                linewidth=1.5,
+                label=f"Gaussian baseline ratio (mean={baseline_mean:.3f})",
+            )
+            plt.legend(frameon=False)
+
+        plt.tight_layout()
+        out_path = os.path.join(violin_dir, f"pathtype_violin_k{k_val:02d}.png")
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        print(f"Saved violin plot for k={k_val} to {os.path.abspath(out_path)}")
+
+    # --------------------------------------------------------
+    # visualize first N passes with Plotly 3D
     # --------------------------------------------------------
     plot_dir = os.path.join(args.outdir, "gaussian_threshold_plots")
     os.makedirs(plot_dir, exist_ok=True)
@@ -403,73 +726,130 @@ def main():
         print(f"  plotting pass #{rank}: state={state_idx} k={k}")
 
         acts_raw = actions_arr[state_idx]
-        # reconstruct X and index_rows exactly like clustering script
-        if acts_raw.ndim == 3:
-            Kc, Tc, A = acts_raw.shape
-            X_full = acts_raw.reshape(Kc * Tc, A)
-            index_rows = [(state_idx, kk, t) for kk in range(Kc) for t in range(Tc)]
-        elif acts_raw.ndim == 2:
-            Tc, A = acts_raw.shape
-            X_full = acts_raw
-            index_rows = [(state_idx, 0, t) for t in range(Tc)]
+        arr = np.asarray(acts_raw)
+
+        # ---------- reconstruct chunk structure ----------
+        if arr.ndim == 3:
+            # arr: (Kc, Tc, A) = (num_chunks, timesteps, action_dim_per_step)
+            Kc, Tc, A = arr.shape
+            traj_matrix = arr.reshape(Kc * Tc, A)        # per-point features
+            chunk_ids = np.repeat(np.arange(Kc), Tc)     # length Kc*Tc
+            time_ids = np.tile(np.arange(Tc), Kc)        # length Kc*Tc
+        elif arr.ndim == 2:
+            # treat each time step as its own "chunk" of length 1
+            T_steps, A = arr.shape
+            Kc, Tc = T_steps, 1
+            traj_matrix = arr.reshape(Kc * Tc, A)
+            chunk_ids = np.arange(Kc)                    # each point is its own chunk
+            time_ids = np.zeros(Kc, dtype=int)
         else:
-            sys.stderr.write(f"[warn] skipping state {state_idx}: unsupported shape {acts_raw.shape}\n")
+            sys.stderr.write(f"[warn] skipping state {state_idx}: unsupported shape {arr.shape}\n")
             continue
 
-        # try to reuse cached best if it matches this k
+        # index_rows: one entry per point (state_idx, chunk_id, time_id)
+        index_rows = [
+            (state_idx, int(c), int(t))
+            for c, t in zip(chunk_ids, time_ids)
+        ]
+
+        # ---------- try to reuse cached best if it matches this k ----------
         cached = maybe_load_best_for_state(state_idx)
+
         if cached is not None and int(cached.get("k", -1)) == k and cached.get("labels") is not None:
-            labels = np.asarray(cached["labels"])
+            # cached labels are per-chunk
+            chunk_labels_cached = np.asarray(cached["labels"])
             used_idx = cached.get("idx", None)
-            X = X_full
-            ir = index_rows
+
             if used_idx is not None and len(used_idx) > 0:
-                X = X_full[used_idx]
-                ir = [index_rows[j] for j in used_idx.tolist()]
+                used_idx = np.asarray(used_idx, dtype=int)
+                # build mapping from original chunk index -> label
+                chunk_label_for_orig = np.full(Kc, -1, dtype=int)
+                for local_idx, orig_idx in enumerate(used_idx):
+                    if 0 <= orig_idx < Kc:
+                        chunk_label_for_orig[orig_idx] = chunk_labels_cached[local_idx]
+
+                # keep only points whose chunks were actually clustered
+                mask = chunk_label_for_orig[chunk_ids] >= 0
+                if not np.any(mask):
+                    sys.stderr.write(
+                        f"[warn] No points to plot for state {state_idx} after applying used_idx.\n"
+                    )
+                    continue
+
+                X = traj_matrix[mask]
+                ir = [index_rows[j] for j in np.where(mask)[0]]
+                labels_per_point = chunk_label_for_orig[chunk_ids[mask]]
+            else:
+                # no subsampling: chunk_labels length should be Kc
+                if chunk_labels_cached.shape[0] != Kc:
+                    sys.stderr.write(
+                        f"[warn] state {state_idx}: expected {Kc} chunk labels, got {chunk_labels_cached.shape[0]}; "
+                        "falling back to reclustering.\n"
+                    )
+                    cached = None  # force recluster below
+                else:
+                    X = traj_matrix
+                    ir = index_rows
+                    labels_per_point = chunk_labels_cached[chunk_ids]
         else:
-            # recluster at this k
-            X = X_full
+            cached = None  # ensure we don't try to use partially
+
+        # ---------- if no usable cache, recluster at this k on points ----------
+        if cached is None:
+            X = traj_matrix
             ir = index_rows
-            A_mat, _, _ = build_affinity_for_points(
-                X,
-                method=args.method,
-                sigma=args.sigma,
-            )
+            # simple Euclidean RBF affinity on points (for visualization only)
+            D = cdist(X, X, metric="euclidean")
+            pos = D[D > 0]
+            sigma_used = float(np.median(pos)) if (args.sigma is None and pos.size) else (args.sigma or 1.0)
+            A_mat = np.exp(-D ** 2 / (2.0 * sigma_used ** 2))
+            np.fill_diagonal(A_mat, 1.0)
+
             cl = SpectralClustering(
                 n_clusters=k,
                 affinity="precomputed",
                 assign_labels="kmeans",
                 random_state=0,
             )
-            labels = cl.fit_predict(A_mat)
+            labels_per_point = cl.fit_predict(A_mat)
 
+        # ---------- now X, labels_per_point, ir all have matching length ----------
         xyz = to_xyz(X, mode=args.ee_mode)
 
-        subdir = os.path.join(plot_dir, f"pass{rank:02d}_state_{state_idx:06d}_k{k:02d}")
+        subdir = os.path.join(
+            plot_dir, f"pass{rank:02d}_state_{state_idx:06d}_k{k:02d}"
+        )
         os.makedirs(subdir, exist_ok=True)
-        overview_png = os.path.join(subdir, "overview.png")
-        percluster_png = os.path.join(subdir, "percluster.png")
+        overview_html = os.path.join(subdir, "overview.html")
+        percluster_html = os.path.join(subdir, "percluster.html")
 
-        title = (f"state={state_idx} k={k} | "
-                 f"var_drop={row.variance_drop:.4f} | "
-                 f"gauss={row.gaussian_baseline_drop:.4f} | "
-                 f"margin={row.beat_margin:.4f}")
+        title = (
+            f"state={state_idx} k={k} | "
+            f"ratio={row.variance_drop_ratio:.4f} | "
+            f"gauss={row.gaussian_baseline_ratio:.4f} | "
+            f"margin={row.beat_margin:.4f}"
+        )
 
         plot_actions_xyz(
-            xyz, labels, ir,
-            png_path=overview_png,
+            xyz,
+            labels_per_point,
+            ir,
+            html_path=overview_html,
             title=title,
-            point_size=1,
-            line_width=1.0,
+            point_size=2,
+            line_width=4.0,
             line_alpha=0.4,
         )
-        n_cls = len(np.unique(labels))
+        n_cls = len(np.unique(labels_per_point))
         plot_per_cluster_panels(
-            xyz, labels, ir, n_clusters=n_cls,
-            png_path=percluster_png,
+            xyz,
+            labels_per_point,
+            ir,
+            n_clusters=n_cls,
+            html_path=percluster_html,
             title_prefix=f"state={state_idx} k={k}",
-            point_size=1,
-            line_width=1.2,
+            point_size=2,
+            line_width=4.0,
             line_alpha=0.55,
         )
 
