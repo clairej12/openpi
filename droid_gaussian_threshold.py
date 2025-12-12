@@ -18,8 +18,13 @@ We:
 1) load metrics
 2) compute Gaussian *reference* baselines per (num_points, action_dim, k),
    using synthetic trajectory "chunks" constructed as:
-       w ~ N(0, I_A), a_t = (t / (T-1)) * w,  t = 0..T-1
-   where T and A are inferred from a real state's actions with that combo.
+       w ~ mixture of N(mu_c, I), c in {0..k-1}
+       a_t = (v_t / v_T) * w,  t = 0..T-1
+   where:
+       - T and A (per_step_dim) are inferred from a real state's actions
+         with that combo,
+       - v_t is the empirical variance at time t from that real state,
+       - v_T is the variance at the final time step.
    We then run Minkowski + spectral clustering on these Gaussian chunks and
    compute the average variance_drop_ratio = (tv - wvar) / tv.
 3) compute variance_drop_ratio for the real states
@@ -27,6 +32,7 @@ We:
 5) save passing rows
 6) produce:
    - per-k violin plots of variance_drop_ratio by path type, with baseline ratio
+   - plots of baseline ratios vs k across all combos
    - Plotly 3D interactive visualizations for the first --plot_pass_top passes
 """
 
@@ -100,18 +106,14 @@ def compute_minkowski_distance_matrix(trajectories):
 def _minkowski_variance_from_D(D):
     """
     D: (N, N) array of symmetrized Minkowski distances between chunks.
-    Implements:
-      Var := E[d^2] + 2 (E[d])^2 - 2 E_x[ (E_{x'}[d(x,x')])^2 ]
+    Here we use a simplified form:
+      Var := 0.5 * E[d^2]
     where expectations are empirical over the N chunks.
     """
     D = np.asarray(D, float)
     if D.size == 0:
         return 0.0
     term1 = float(np.mean(D ** 2))          # E[d^2]
-    mean_d = float(np.mean(D))             # E[d]
-    row_means = D.mean(axis=1)             # E_{x'}[d(x,x')]
-    term3 = float(np.mean(row_means ** 2)) # E_x[(E_{x'}[d])^2]
-    # return term1 + 2.0 * (mean_d ** 2) - 2.0 * term3
     return 0.5 * term1
 
 
@@ -167,10 +169,14 @@ def to_xyz(actions, mode="first3", pca_model=None, kinematic_map=None):
             Z = pca_model.transform(X)
         return Z
 
+
 viridis = matplotlib.colormaps.get_cmap("viridis")
+
+
 def cval_to_hex(cval):
     r, g, b, _ = viridis(cval)
     return f"rgb({int(r*255)}, {int(g*255)}, {int(b*255)})"
+
 
 def plot_actions_xyz(xyz, labels, index_rows, html_path="", title="",
                      point_size=2, line_width=4.0, line_alpha=0.6):
@@ -191,8 +197,7 @@ def plot_actions_xyz(xyz, labels, index_rows, html_path="", title="",
     # Consistent color map
     uniq = np.unique(labels)
     uniq_sorted = np.sort(uniq)
-    color_map = {lab: i / max(1, len(uniq_sorted)-1) for i, lab in enumerate(uniq_sorted)}
-    # These remain normalized [0,1], Plotly Viridis will interpret automatically
+    color_map = {lab: i / max(1, len(uniq_sorted) - 1) for i, lab in enumerate(uniq_sorted)}
 
     fig = go.Figure()
 
@@ -280,6 +285,7 @@ def plot_actions_xyz(xyz, labels, index_rows, html_path="", title="",
     )
 
     fig.write_html(html_path)
+
 
 def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters,
                             html_path, title_prefix="State",
@@ -417,49 +423,86 @@ def load_per_state_file(path):
 
 
 # ------------------------------------------------------------
-# Gaussian *trajectory* baseline for ratio
+# Gaussian *trajectory* baseline for ratio with mixture + variance profile
 # ------------------------------------------------------------
 def gaussian_baseline_ratio(num_chunks,
                             per_step_dim,
                             chunk_len,
                             k,
+                            v_scales,
                             n_trials=30,
                             rng=None,
                             sigma=None):
     """
     For each trial:
-      - Generate num_chunks synthetic trajectories (chunks) of length chunk_len in R^{per_step_dim}:
-            w ~ N(0, I)
-            a_t = (t / (chunk_len - 1)) * w,   t = 0..chunk_len-1
-        (if chunk_len == 1, use just w as a single step)
-      - Compute Minkowski distance matrix between chunks
-      - Compute total variance tv
-      - Build Gaussian affinity from D using the same median-sigma logic
+      - Build num_chunks synthetic trajectories (chunks) of length chunk_len
+        in R^{per_step_dim}:
+
+            * Choose mixture component index c ~ Uniform{0,...,k-1}
+            * Define mean mu_c:
+                - if k == 1: mu_c = 0.0
+                - if k >= 2: component means are spaced as
+                      mu_c in {-(k-1)/2, ..., (k-1)/2} scaled by 1/k
+                  which yields e.g.
+                      k=1: [0]
+                      k=2: [-0.5, 0.5]
+                      k=3: [-1, 0, 1], etc.
+            * Sample w ~ N(mu_c * 1, I) in R^{per_step_dim}
+            * For t=0,...,chunk_len-1:
+                  a_t = (v_t / v_T) * w
+              where v_t, v_T are encoded in v_scales[t] = v_t / v_T.
+
+      - Compute Minkowski distance matrix between these chunks
+      - Compute total variance tv (using Minkowski variance)
+      - Build RBF affinity from D using the same median-sigma logic
       - Run spectral clustering with n_clusters = k
-      - Compute weighted in-cluster variance wvar
+      - Compute weighted in-cluster variance wvar (Minkowski)
       - Compute variance_drop_ratio = (tv - wvar) / tv
+
     Return the average variance_drop_ratio over trials.
     """
     if rng is None:
         rng = np.random.RandomState(0)
 
+    v_scales = np.asarray(v_scales, dtype=float)
+    if chunk_len <= 0:
+        return 0.0
+    if v_scales.shape[0] != chunk_len:
+        # Fallback: broadcast or truncate if mismatch
+        if v_scales.shape[0] > chunk_len:
+            v_scales = v_scales[:chunk_len]
+        else:
+            v_scales = np.pad(v_scales, (0, chunk_len - v_scales.shape[0]), mode="edge")
+
+    # define mixture means
+    if k <= 1:
+        means = np.array([0.0], dtype=float)
+    else:
+        # spacing: total span (k-1), centered at 0, scaled by 1/k
+        centers = np.linspace(-(k - 1) / 2.0, (k - 1) / 2.0, k)
+        means = centers / max(1.0, k)  # e.g., k=2 -> [-0.5, 0.5]
+
     ratios = []
     for _ in range(n_trials):
         trajectories = []
+
         # build synthetic Gaussian trajectories
         for _c in range(num_chunks):
-            w = rng.randn(per_step_dim)
-            if chunk_len <= 1:
-                traj = w.reshape(1, per_step_dim)
+            comp = rng.randint(0, k if k > 0 else 1)
+            mu = means[comp if k > 1 else 0]
+            # w ~ N(mu, 1) (per dimension)
+            w = rng.randn(per_step_dim) + mu
+
+            if chunk_len == 1:
+                traj = (v_scales[0] * w).reshape(1, per_step_dim)
             else:
-                t_grid = np.arange(chunk_len, dtype=float)
-                t_grid = t_grid / max(chunk_len - 1, 1.0)
-                traj = (t_grid[:, None] * w[None, :])
+                # a_t = v_scale[t] * w
+                traj = (v_scales[:, None] * w[None, :])
             trajectories.append(traj)
 
         # Minkowski distance matrix
         D_mink = compute_minkowski_distance_matrix(trajectories)
-        tv = total_variance_minkowski(D_mink)
+        tv = total_variance_minkowski(D_mink)  # <-- Minkowski total variance
         if tv <= 0:
             continue
 
@@ -482,7 +525,7 @@ def gaussian_baseline_ratio(num_chunks,
         except Exception:
             continue
 
-        wvar = weighted_incluster_variance_minkowski(D_mink, labels)
+        wvar = weighted_incluster_variance_minkowski(D_mink, labels)  # <-- Minkowski cluster variance
         drop = tv - wvar
         if tv > 0:
             ratios.append(drop / tv)
@@ -536,7 +579,7 @@ def main():
     metrics_df["variance_drop_ratio"] = ratio
 
     # --------------------------------------------------------
-    # Build (num_points, action_dim, k) -> (chunk_len, per_step_dim)
+    # Build (num_points, action_dim, k) -> (chunk_len, per_step_dim, v_scales)
     # using a representative state for each combo
     # --------------------------------------------------------
     combo_to_params = {}
@@ -555,11 +598,39 @@ def main():
             Kc, Tc, A = arr.shape
             chunk_len = Tc
             per_step_dim = A
+
+            # compute per-time-step variance over all chunks and dims
+            v_t = []
+            for t in range(Tc):
+                slice_t = arr[:, t, :].reshape(-1)
+                v_t.append(np.var(slice_t))
+            v_t = np.asarray(v_t, dtype=float)
+
+            # guard against all-zero variance
+            v_T = v_t[-1] if v_t[-1] > 0 else (np.max(v_t) if np.max(v_t) > 0 else 1.0)
+            v_scales = v_t / v_T
+
+            # ---- DEBUG PRINT: per time-step variance and scales ----
+            print(
+                f"[combo params] (num_points={Np}, action_dim={d}, k={k}) "
+                f"state={state_idx}, chunk_len={chunk_len}, per_step_dim={per_step_dim}"
+            )
+            print(f"  v_t (per-time-step variance): {np.array2string(v_t, precision=4)}")
+            print(f"  v_scales (v_t / v_T):        {np.array2string(v_scales, precision=4)}")
+
         elif arr.ndim == 2:
             # (T, A); in the main script, each time step is a 1-step trajectory
-            T, A = arr.shape
+            T_steps, A = arr.shape
             chunk_len = 1
             per_step_dim = A
+            v_scales = np.array([1.0], dtype=float)
+
+            print(
+                f"[combo params] (num_points={Np}, action_dim={d}, k={k}) "
+                f"state={state_idx}, chunk_len={chunk_len}, per_step_dim={per_step_dim}"
+            )
+            print("  2D actions: using single-step chunk; v_scales=[1.0]")
+
         else:
             sys.stderr.write(
                 f"[warn] state {state_idx}: unsupported action shape {arr.shape}; "
@@ -567,27 +638,39 @@ def main():
             )
             continue
 
-        combo_to_params[key] = (chunk_len, per_step_dim)
+        combo_to_params[key] = (chunk_len, per_step_dim, v_scales)
 
     print(f"Found {len(combo_to_params)} unique (num_points, action_dim, k) combos for Gaussian baseline")
 
     rng = np.random.RandomState(0)
     combo_to_baseline_ratio = {}
+    baseline_records = []  # for plotting baselines vs k
 
     # --------------------------------------------------------
     # Compute Gaussian baseline variance_drop_ratio per combo
     # --------------------------------------------------------
-    for (Np, d, k), (chunk_len, per_step_dim) in combo_to_params.items():
+    for (Np, d, k), (chunk_len, per_step_dim, v_scales) in combo_to_params.items():
         base_ratio = gaussian_baseline_ratio(
             num_chunks=Np,
             per_step_dim=per_step_dim,
             chunk_len=chunk_len,
             k=k,
+            v_scales=v_scales,
             n_trials=args.gaussian_trials,
             rng=rng,
             sigma=args.sigma,
         )
         combo_to_baseline_ratio[(Np, d, k)] = base_ratio
+
+        # ---- DEBUG PRINT: check that this is Minkowski-based baseline ----
+        print(
+            f"[gaussian baseline | Minkowski] combo (num_points={Np}, action_dim={d}, k={k}) "
+            f"-> baseline variance_drop_ratio = {base_ratio:.6f}"
+        )
+
+        baseline_records.append(
+            {"num_points": Np, "action_dim": d, "k": k, "baseline_ratio": base_ratio}
+        )
 
     # --------------------------------------------------------
     # Apply threshold using variance_drop_ratio
@@ -618,6 +701,61 @@ def main():
     pass_df.to_csv(pass_csv, index=False)
     print(f"Saved filtered passes to: {pass_csv}")
     print(f"{len(pass_df)} state+k rows passed the Gaussian-based threshold.")
+
+    # --------------------------------------------------------
+    # Plot all Gaussian baselines vs k (with k clearly indicated)
+    # --------------------------------------------------------
+    baseline_dir = os.path.join(args.outdir, "gaussian_baseline_plots")
+    os.makedirs(baseline_dir, exist_ok=True)
+
+    if baseline_records:
+        base_df = pd.DataFrame(baseline_records)
+
+        # 1) Scatter of all baseline ratios vs k (each combo)
+        plt.figure(figsize=(7, 5))
+        plt.scatter(
+            base_df["k"].astype(int),
+            base_df["baseline_ratio"],
+            s=20,
+            alpha=0.7,
+        )
+        plt.xlabel("k (number of clusters)")
+        plt.ylabel("Gaussian baseline variance_drop_ratio")
+        plt.title("Gaussian baseline variance_drop_ratio vs k (all combos)")
+        plt.grid(True, alpha=0.3)
+        out_path_scatter = os.path.join(baseline_dir, "baseline_ratio_vs_k_scatter.png")
+        plt.tight_layout()
+        plt.savefig(out_path_scatter, dpi=150)
+        plt.close()
+        print(f"Saved baseline scatter vs k to {os.path.abspath(out_path_scatter)}")
+
+        # 2) Mean baseline ratio per k (line plot)
+        mean_per_k = base_df.groupby("k")["baseline_ratio"].mean().reset_index()
+        plt.figure(figsize=(7, 5))
+        plt.plot(
+            mean_per_k["k"].astype(int),
+            mean_per_k["baseline_ratio"],
+            marker="o",
+            linewidth=2,
+        )
+        plt.xlabel("k (number of clusters)")
+        plt.ylabel("Mean Gaussian baseline variance_drop_ratio")
+        plt.title("Mean Gaussian baseline variance_drop_ratio by k")
+        for _, r in mean_per_k.iterrows():
+            plt.text(
+                r["k"],
+                r["baseline_ratio"],
+                f"k={int(r['k'])}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        plt.grid(True, alpha=0.3)
+        out_path_mean = os.path.join(baseline_dir, "baseline_ratio_vs_k_mean.png")
+        plt.tight_layout()
+        plt.savefig(out_path_mean, dpi=150)
+        plt.close()
+        print(f"Saved mean baseline plot vs k to {os.path.abspath(out_path_mean)}")
 
     # --------------------------------------------------------
     # Aggregated violin plots: variance_drop_ratio by path type per k
@@ -681,7 +819,8 @@ def main():
         x_positions = np.arange(1, len(labels_pt) + 1)
 
         plt.figure(figsize=(max(7, 0.8 * len(labels_pt)), 5))
-        vp = plt.violinplot(data, positions=x_positions, showmeans=False, showmedians=True, showextrema=True)
+        _ = plt.violinplot(data, positions=x_positions,
+                           showmeans=False, showmedians=True, showextrema=True)
 
         plt.xticks(x_positions, labels_pt, rotation=45, ha="right")
         plt.ylabel("Variance drop ratio (passing rows)")
@@ -693,7 +832,7 @@ def main():
                 baseline_mean,
                 linestyle="--",
                 linewidth=1.5,
-                label=f"Gaussian baseline ratio (mean={baseline_mean:.3f})",
+                label=f"Gaussian baseline ratio (mean={baseline_mean:.3f}; k={k_val})",
             )
             plt.legend(frameon=False)
 

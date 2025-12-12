@@ -22,12 +22,19 @@ OUTDIR=droid_1.0.1_lerobot
 # #   --parallel_dtw \
 # #   --method dtw \
 
-python droid_gaussian_threshold.py \
+# python droid_gaussian_threshold.py \
+#   --metrics_csv $OUTDIR/all_multimodality/metrics_per_state.csv \
+#   --outdir $OUTDIR/gaussian_threshold_out \
+#   --actions_npz $OUTDIR/actions.npz \
+#   --gaussian_trials 5 \
+#   --gaussian_max_points 10000 \
+#   --gaussian_multiplier 0.75 \
+#   --plot_pass_top 50 \
+#   --ee_mode first3
+
+python analyze_pour_multimodality_trajectories.py \
   --metrics_csv $OUTDIR/all_multimodality/metrics_per_state.csv \
-  --outdir $OUTDIR/gaussian_threshold_out \
   --actions_npz $OUTDIR/actions.npz \
-  --gaussian_trials 5 \
-  --gaussian_max_points 10000 \
-  --gaussian_multiplier 0.75 \
-  --plot_pass_top 50 \
-  --ee_mode first3
+  --outdir $OUTDIR/pour_multimodality_plots \
+  --episodes_per_band 3 \
+  --task_keyword Pour
