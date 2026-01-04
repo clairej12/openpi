@@ -125,14 +125,21 @@
 #     --out_dir droid_100_all \
 #     --image_dir droid_100_images
 
-uv run record_droid_sanity_check.py \
-    --data_dir /media/volume/droid_data/DROID/droid_1.0.1/ \
-    --format lerobot \
-    --max_episodes 100 \
-    --port 8124 \
-    --prompt "" \
-    --samples_per_state 50 \
-    --save_npz \
-    --checkpoint_by_episode \
-    --out_dir droid_1.0.1_lerobot \
-    --image_dir droid_1.0.1_images
+# uv run record_droid_sanity_check.py \
+#     --data_dir /media/volume/droid_data/DROID/droid_1.0.1/ \
+#     --format lerobot \
+#     --max_episodes 100 \
+#     --port 8124 \
+#     --prompt "" \
+#     --samples_per_state 50 \
+#     --save_npz \
+#     --checkpoint_by_episode \
+#     --out_dir droid_1.0.1_lerobot \
+#     --image_dir droid_1.0.1_images
+
+uv run patch_task_metadata.py \
+  --metrics_csv droid_1.0.1_lerobot/all_multimodality/metrics_per_state.csv \
+  --out_csv droid_1.0.1_lerobot/all_multimodality/metrics_per_state_patched.csv \
+  --lerobot_root /media/volume/droid_data/DROID/droid_1.0.1/ \
+  --summary_csv droid_1.0.1_lerobot/summary.csv \
+  --summary_out_csv droid_1.0.1_lerobot/summary_patched.csv \
