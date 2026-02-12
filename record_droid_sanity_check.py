@@ -3,6 +3,7 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import argparse, atexit, logging, threading, time, os, re, glob
+import collections
 from typing import Dict, Tuple, Any, List, Optional
 import numpy as np
 import pandas as pd
@@ -81,6 +82,10 @@ class InProcessPolicyServer:
         try:
             if self._server:
                 logging.info("Stopping policy server...")
+                if hasattr(self._server, "shutdown"):
+                    self._server.shutdown()
+                elif hasattr(self._server, "close"):
+                    self._server.close()
             if self._thread:
                 self._thread.join(timeout=2.0)
         except Exception as e:
@@ -132,14 +137,43 @@ def _flush_shard_checkpoint(out_dir: str, shard_idx: int, rows: List[Dict[str, A
     logging.info("Wrote shard %d with %d steps.", shard_idx, len(rows))
 
 
+def _load_existing_pairs(out_dir: str) -> set[tuple[str, int]]:
+    csv_paths = []
+    summary_csv = os.path.join(out_dir, "summary.csv")
+    if os.path.exists(summary_csv):
+        csv_paths.append(summary_csv)
+
+    episode_glob = os.path.join(out_dir, "episodes", "*", "summary.csv")
+    csv_paths.extend(sorted(glob.glob(episode_glob)))
+
+    shard_glob = os.path.join(out_dir, "shards", "*_summary.csv")
+    csv_paths.extend(sorted(glob.glob(shard_glob)))
+
+    existing = set()
+    for path in csv_paths:
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            logging.warning("Failed reading %s: %s", path, e)
+            continue
+        if {"episode_id", "t_in_episode"} <= set(df.columns):
+            df["episode_id"] = df["episode_id"].astype(str)
+            df = df.dropna(subset=["t_in_episode"])
+            df["t_in_episode"] = df["t_in_episode"].astype(int)
+            existing.update((eid, t) for eid, t in zip(df["episode_id"], df["t_in_episode"]))
+    if existing:
+        logging.info("Loaded %d existing (episode_id, t_in_episode) pairs for dedup.", len(existing))
+    return existing
+
+
 # =========================================================
 # RLDS / TFDS iterator (your previous logic)
 # =========================================================
-def _iter_rlds_steps(episode):
+def _iter_rlds_steps(episode, tfds_module):
     """Yield (t_in_ep, step_np) from an RLDS-style episode from TFDS."""
     steps_obj = episode["steps"]
     try:
-        for t, step in enumerate(tfds.as_numpy(steps_obj)):
+        for t, step in enumerate(tfds_module.as_numpy(steps_obj)):
             yield t, step
         return
     except Exception:
@@ -147,7 +181,7 @@ def _iter_rlds_steps(episode):
 
     # fallback for dict-of-arrays
     try:
-        ep_np = tfds.as_numpy(episode)
+        ep_np = tfds_module.as_numpy(episode)
         steps_np = ep_np["steps"]
         if isinstance(steps_np, dict):
             T = min(len(v) for v in steps_np.values())
@@ -177,7 +211,41 @@ def _discover_lerobot_parquets(data_root: str):
         yield chunk_idx, file_idx, path
 
 
-def _load_lerobot_frame_from_video(video_path: str, frame_idx: int):
+class _VideoReaderCache:
+    def __init__(self, max_open: int = 8):
+        self._max_open = max_open
+        self._readers = collections.OrderedDict()
+
+    def get(self, video_path: str):
+        reader = self._readers.get(video_path)
+        if reader is not None:
+            self._readers.move_to_end(video_path)
+            return reader
+        if not os.path.exists(video_path):
+            return None
+        try:
+            reader = imageio.get_reader(video_path)
+        except Exception:
+            return None
+        self._readers[video_path] = reader
+        if len(self._readers) > self._max_open:
+            old_path, old_reader = self._readers.popitem(last=False)
+            try:
+                old_reader.close()
+            except Exception:
+                logging.warning("Failed to close reader for %s", old_path)
+        return reader
+
+    def close_all(self):
+        for path, reader in list(self._readers.items()):
+            try:
+                reader.close()
+            except Exception:
+                logging.warning("Failed to close reader for %s", path)
+        self._readers.clear()
+
+
+def _load_lerobot_frame_from_video(video_path: str, frame_idx: int, reader_cache: Optional[_VideoReaderCache] = None):
     """Return an RGB uint8 image for given frame_idx or None if missing/unreadable."""
     if imageio is None:
         return None
@@ -185,16 +253,22 @@ def _load_lerobot_frame_from_video(video_path: str, frame_idx: int):
         return None
     try:
         # open and read specific frame
-        reader = imageio.get_reader(video_path)
-        img = reader.get_data(frame_idx)
-        reader.close()
+        if reader_cache is None:
+            reader = imageio.get_reader(video_path)
+            img = reader.get_data(frame_idx)
+            reader.close()
+        else:
+            reader = reader_cache.get(video_path)
+            if reader is None:
+                return None
+            img = reader.get_data(frame_idx)
         return _ensure_uint8_rgb(img)
     except Exception as e:
         logging.warning("Failed to read frame %d from %s: %s", frame_idx, video_path, e)
         return None
 
 
-def _iter_lerobot_steps(data_root: str):
+def _iter_lerobot_steps(data_root: str, *, frame_stride: int = 1, max_video_readers: int = 8):
     """
     Yield dicts that look like RLDS steps from the LeRobot layout:
       {
@@ -217,73 +291,88 @@ def _iter_lerobot_steps(data_root: str):
         "observation.images.exterior_2_left",
     ]
 
-    for chunk_idx, file_idx, parquet_path in _discover_lerobot_parquets(data_root):
-        df = pd.read_parquet(parquet_path)
-        # per this dataset, each row is 1 frame
-        for row_idx, row in df.iterrows():
-            # episode_id/index in metadata
-            episode_index = int(row.get("episode_index", 0))
-            frame_index = int(row.get("frame_index", row_idx))
-            # we mimic your previous episode_id style
-            episode_id = f"ep{episode_index:06d}"
+    reader_cache = _VideoReaderCache(max_open=max_video_readers)
+    try:
+        for chunk_idx, file_idx, parquet_path in _discover_lerobot_parquets(data_root):
+            df = pd.read_parquet(parquet_path)
+            # per this dataset, each row is 1 frame
+            for row_idx, row in df.iterrows():
+                # episode_id/index in metadata
+                episode_index = int(row.get("episode_index", 0))
+                frame_index = int(row.get("frame_index", row_idx))
+                if frame_stride > 1 and (frame_index % frame_stride) != 0:
+                    continue
+                # we mimic your previous episode_id style
+                episode_id = f"ep{episode_index:06d}"
 
-            # build observation dict
-            obs = {}
+                # build observation dict
+                obs = {}
 
-            # add state-like fields if present
-            # the dataset actually gives several variants; we'll prefer the 8-dim one if present
-            if "observation.state" in df.columns:
-                state = np.array(row["observation.state"], dtype=np.float32).reshape(-1)
-                obs["state"] = state
-                # split into joint + gripper if we can
-                if state.size >= 7:
-                    obs["joint_position"] = state[:7].astype(np.float32)
-                if state.size >= 8:
-                    obs["gripper_position"] = state[7:8].astype(np.float32)
-            else:
-                # fallback: separate columns
-                if "observation.state.joint_position" in df.columns:
-                    obs["joint_position"] = np.array(row["observation.state.joint_position"], dtype=np.float32).reshape(-1)
-                if "observation.state.gripper_position" in df.columns:
-                    obs["gripper_position"] = np.array(row["observation.state.gripper_position"], dtype=np.float32).reshape(-1)
+                # add state-like fields if present
+                # the dataset actually gives several variants; we'll prefer the 8-dim one if present
+                if "observation.state" in df.columns:
+                    state = np.array(row["observation.state"], dtype=np.float32).reshape(-1)
+                    obs["state"] = state
+                    # split into joint + gripper if we can
+                    if state.size >= 7:
+                        obs["joint_position"] = state[:7].astype(np.float32)
+                    if state.size >= 8:
+                        obs["gripper_position"] = state[7:8].astype(np.float32)
+                else:
+                    # fallback: separate columns
+                    if "observation.state.joint_position" in df.columns:
+                        obs["joint_position"] = np.array(row["observation.state.joint_position"], dtype=np.float32).reshape(-1)
+                    if "observation.state.gripper_position" in df.columns:
+                        obs["gripper_position"] = np.array(row["observation.state.gripper_position"], dtype=np.float32).reshape(-1)
 
-            # language/instruction fields
-            if "language_instruction" in df.columns:
-                obs["language_instruction"] = row["language_instruction"]
-            if "language_instruction_2" in df.columns:
-                obs["language_instruction_2"] = row["language_instruction_2"]
-            if "language_instruction_3" in df.columns:
-                obs["language_instruction_3"] = row["language_instruction_3"]
+                # language/instruction fields
+                if "language_instruction" in df.columns:
+                    obs["language_instruction"] = row["language_instruction"]
+                if "language_instruction_2" in df.columns:
+                    obs["language_instruction_2"] = row["language_instruction_2"]
+                if "language_instruction_3" in df.columns:
+                    obs["language_instruction_3"] = row["language_instruction_3"]
 
-            # now try to load images from videos
-            at_least_one_image = False
-            for vk in video_keys:
-                video_path = os.path.join(
-                    data_root,
-                    "videos",
-                    vk,
-                    f"chunk-{chunk_idx:03d}",
-                    f"file-{file_idx:03d}.mp4",
-                )
-                img = _load_lerobot_frame_from_video(video_path, row_idx)
-                if img is not None:
-                    # shorten key names to match your image picking code expectations
-                    short_k = vk.split(".")[-1]  # e.g. "exterior_1_left"
-                    obs[short_k] = img
-                    at_least_one_image = True
+                # now try to load images from videos
+                at_least_one_image = False
+                for vk in video_keys:
+                    video_path = os.path.join(
+                        data_root,
+                        "videos",
+                        vk,
+                        f"chunk-{chunk_idx:03d}",
+                        f"file-{file_idx:03d}.mp4",
+                    )
+                    img = _load_lerobot_frame_from_video(video_path, frame_index, reader_cache=reader_cache)
+                    if img is not None:
+                        # shorten key names to match your image picking code expectations
+                        short_k = vk.split(".")[-1]  # e.g. "exterior_1_left"
+                        obs[short_k] = img
+                        at_least_one_image = True
 
-            if not at_least_one_image:
-                # user said: "we should skip those that appear in the metadata but don't have video"
-                continue
+                if not at_least_one_image:
+                    # user said: "we should skip those that appear in the metadata but don't have video"
+                    continue
 
-            # yield in a shape similar to RLDS step
-            step = {
-                "episode_id": episode_id,
-                "episode_index": episode_index,
-                "t_in_episode": frame_index,   # it's okay if it's per-ep frame index
-                "observation": obs,
-            }
-            yield episode_id, episode_index, frame_index, step
+                # yield in a shape similar to RLDS step
+                step = {
+                    "episode_id": episode_id,
+                    "episode_index": episode_index,
+                    "t_in_episode": frame_index,   # it's okay if it's per-ep frame index
+                    "observation": obs,
+                }
+                yield episode_id, episode_index, frame_index, step
+    finally:
+        reader_cache.close_all()
+
+
+def _str_to_bool(v: str) -> bool:
+    v = str(v).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
 
 
 # =========================================================
@@ -308,6 +397,9 @@ def main():
     ap.add_argument("--save_npz", action="store_true")
     ap.add_argument("--out_dir", type=str, default="droid_sanity")
     ap.add_argument("--samples_per_state", type=int, default=1)
+    ap.add_argument("--save_images", type=_str_to_bool, default=True)
+    ap.add_argument("--frame_stride", type=int, default=1)
+    ap.add_argument("--max_video_readers", type=int, default=8)
 
     ap.add_argument("--checkpoint_by_episode", action="store_true")
     ap.add_argument("--checkpoint_every_steps", type=int, default=0)
@@ -340,20 +432,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.image_dir, exist_ok=True)
 
-    # --- load existing summary to build skip set ---
-    existing_pairs = set()
-    summary_csv_path = os.path.join(args.out_dir, "summary.csv")
-    if os.path.exists(summary_csv_path):
-        try:
-            _old_df = pd.read_csv(summary_csv_path)
-            if {"episode_id", "t_in_episode"} <= set(_old_df.columns):
-                _old_df["episode_id"] = _old_df["episode_id"].astype(str)
-                _old_df = _old_df.dropna(subset=["t_in_episode"])
-                _old_df["t_in_episode"] = _old_df["t_in_episode"].astype(int)
-                existing_pairs = {(eid, t) for eid, t in zip(_old_df["episode_id"], _old_df["t_in_episode"])}
-                logging.info("Loaded %d existing (episode_id, t_in_episode) pairs for dedup.", len(existing_pairs))
-        except Exception as e:
-            logging.warning("Failed reading existing summary.csv: %s", e)
+    # --- load existing summaries to build skip set (summary.csv + episode/shard checkpoints) ---
+    existing_pairs = _load_existing_pairs(args.out_dir)
 
     # global buffers
     rows_global: List[Dict[str, Any]] = []
@@ -387,6 +467,7 @@ def main():
         for ep_idx, episode in enumerate(ds):
             if episodes_processed >= args.max_episodes:
                 break
+            logging.info("Processing episode %d ...", ep_idx)
 
             # instruction accumulators
             instr_accum = {
@@ -401,7 +482,9 @@ def main():
             task_name = None
             instruction_any = None
 
-            for t_in_ep, step_np in _iter_rlds_steps(episode):
+            for t_in_ep, step_np in _iter_rlds_steps(episode, tfds):
+                if args.frame_stride > 1 and (int(t_in_ep) % args.frame_stride) != 0:
+                    continue
                 g_idx += 1
                 # infer meta
                 meta = step_np  # already numpy-like
@@ -431,15 +514,18 @@ def main():
                 left = _ensure_uint8_rgb(obs[left_key])
                 wrist = _ensure_uint8_rgb(obs[wrist_key])
 
-                ep_dir = os.path.join(args.image_dir, episode_id)
-                os.makedirs(ep_dir, exist_ok=True)
-                left_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_left.jpg")
-                wrist_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_wrist.jpg")
+                left_path = ""
+                wrist_path = ""
+                if args.save_images:
+                    ep_dir = os.path.join(args.image_dir, episode_id)
+                    os.makedirs(ep_dir, exist_ok=True)
+                    left_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_left.jpg")
+                    wrist_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_wrist.jpg")
 
-                if args.overwrite_images or not os.path.exists(left_path):
-                    Image.fromarray(left).save(left_path, quality=90)
-                if args.overwrite_images or not os.path.exists(wrist_path):
-                    Image.fromarray(wrist).save(wrist_path, quality=90)
+                    if args.overwrite_images or not os.path.exists(left_path):
+                        Image.fromarray(left).save(left_path, quality=90)
+                    if args.overwrite_images or not os.path.exists(wrist_path):
+                        Image.fromarray(wrist).save(wrist_path, quality=90)
 
                 # get joint/gripper
                 joint = obs.get("joint_position", np.zeros((7,), dtype=np.float32)).astype(np.float32).reshape(-1)
@@ -467,8 +553,12 @@ def main():
                     chunks_arr = np.array(chunks, dtype=object)
 
                 m_arr = np.asarray(chunks_arr)
-                mean_vec = m_arr.mean(axis=0).mean(axis=0)
-                std_vec = m_arr.std(axis=0).std(axis=0)
+                if m_arr.ndim == 1:
+                    mean_vec = m_arr
+                    std_vec = np.zeros_like(m_arr)
+                else:
+                    mean_vec = m_arr.mean(axis=0).mean(axis=0)
+                    std_vec = m_arr.std(axis=0).std(axis=0)
 
                 row_dict = {
                     "global_step_index": g_idx,
@@ -479,8 +569,8 @@ def main():
                     "t_in_episode": t_in_ep,
                     "picked_left_key": left_key,
                     "picked_wrist_key": wrist_key,
-                    "left_img_path": os.path.relpath(left_path, args.out_dir),
-                    "wrist_img_path": os.path.relpath(wrist_path, args.out_dir),
+                    "left_img_path": os.path.relpath(left_path, args.out_dir) if left_path else "",
+                    "wrist_img_path": os.path.relpath(wrist_path, args.out_dir) if wrist_path else "",
                     "samples_per_state": K,
                     "actions_shape": str(np.shape(chunks_arr)),
                     **{f"mean_{i}": float(m) for i, m in enumerate(mean_vec)},
@@ -501,13 +591,16 @@ def main():
                         shard_rows.clear()
                         shard_actions.clear()
 
-            episodes_seen[episode_id] = {
-                "episode_index": ep_idx,
-                "episode_id": episode_id,
-                "task_name": "",
-                "instruction_any": "",
-                "num_states_collected": len(rows_ep),
-            }
+            if episode_id is not None:
+                if len(rows_ep) == 0:
+                    logging.info("Skipped episode %s (no states collected).", episode_id)
+                episodes_seen[episode_id] = {
+                    "episode_index": ep_idx,
+                    "episode_id": episode_id,
+                    "task_name": "",
+                    "instruction_any": "",
+                    "num_states_collected": len(rows_ep),
+                }
 
             if args.checkpoint_by_episode:
                 _flush_episode_checkpoint(args.out_dir, episode_id, rows_ep, actions_ep)
@@ -523,19 +616,29 @@ def main():
         rows_ep = []
         actions_ep = []
 
-        for (episode_id, episode_index, frame_index, step) in _iter_lerobot_steps(args.data_dir):
+        for (episode_id, episode_index, frame_index, step) in _iter_lerobot_steps(
+            args.data_dir,
+            frame_stride=max(1, args.frame_stride),
+            max_video_readers=max(1, args.max_video_readers),
+        ):
             # if we’ve moved to a new episode, flush the previous one (if requested)
             if current_ep_id is not None and episode_id != current_ep_id:
+                if len(rows_ep) == 0:
+                    logging.info("Skipped episode %s (no states collected).", current_ep_id)
                 print(f"Finished episode {current_ep_id} ({len(rows_ep)} states).")
                 if args.checkpoint_by_episode:
                     _flush_episode_checkpoint(args.out_dir, current_ep_id, rows_ep, actions_ep)
                 rows_ep = []
                 actions_ep = []
+                logging.info("Processing episode %s (index=%d) ...", episode_id, episode_index)
 
             # stop condition: count distinct episodes
             if episode_id not in episodes_seen and len(episodes_seen) >= args.max_episodes:
+                logging.info("Skipping episode %s (max_episodes reached).", episode_id)
                 break
 
+            if current_ep_id is None:
+                logging.info("Processing episode %s (index=%d) ...", episode_id, episode_index)
             current_ep_id = episode_id  # track
 
             g_idx += 1
@@ -565,16 +668,19 @@ def main():
             joint = obs.get("joint_position", np.zeros((7,), dtype=np.float32)).astype(np.float32).reshape(-1)
             gripper = obs.get("gripper_position", np.zeros((1,), dtype=np.float32)).astype(np.float32).reshape(-1)[:1]
 
-            # save images
-            ep_dir = os.path.join(args.image_dir, episode_id)
-            os.makedirs(ep_dir, exist_ok=True)
-            left_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_left.jpg")
-            wrist_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_wrist.jpg")
+            # save images (optional)
+            left_path = ""
+            wrist_path = ""
+            if args.save_images:
+                ep_dir = os.path.join(args.image_dir, episode_id)
+                os.makedirs(ep_dir, exist_ok=True)
+                left_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_left.jpg")
+                wrist_path = os.path.join(ep_dir, f"state_{t_in_ep:06d}_wrist.jpg")
 
-            if args.overwrite_images or not os.path.exists(left_path):
-                Image.fromarray(left).save(left_path, quality=90)
-            if args.overwrite_images or not os.path.exists(wrist_path):
-                Image.fromarray(wrist).save(wrist_path, quality=90)
+                if args.overwrite_images or not os.path.exists(left_path):
+                    Image.fromarray(left).save(left_path, quality=90)
+                if args.overwrite_images or not os.path.exists(wrist_path):
+                    Image.fromarray(wrist).save(wrist_path, quality=90)
 
             # run policy
             left_224 = image_tools.resize_with_pad(left, 224, 224)
@@ -598,8 +704,12 @@ def main():
                 chunks_arr = np.array(chunks, dtype=object)
 
             m_arr = np.asarray(chunks_arr)
-            mean_vec = m_arr.mean(axis=0).mean(axis=0)
-            std_vec = m_arr.std(axis=0).std(axis=0)
+            if m_arr.ndim == 1:
+                mean_vec = m_arr
+                std_vec = np.zeros_like(m_arr)
+            else:
+                mean_vec = m_arr.mean(axis=0).mean(axis=0)
+                std_vec = m_arr.std(axis=0).std(axis=0)
 
             row_dict = {
                 "global_step_index": g_idx,
@@ -610,8 +720,8 @@ def main():
                 "t_in_episode": t_in_ep,
                 "picked_left_key": left_key,
                 "picked_wrist_key": wrist_key,
-                "left_img_path": os.path.relpath(left_path, args.out_dir),
-                "wrist_img_path": os.path.relpath(wrist_path, args.out_dir),
+                "left_img_path": os.path.relpath(left_path, args.out_dir) if left_path else "",
+                "wrist_img_path": os.path.relpath(wrist_path, args.out_dir) if wrist_path else "",
                 "samples_per_state": K,
                 "actions_shape": str(np.shape(chunks_arr)),
                 **{f"mean_{i}": float(m) for i, m in enumerate(mean_vec)},
@@ -650,6 +760,8 @@ def main():
         # after the loop, flush the last episode we were working on
         if args.checkpoint_by_episode and current_ep_id is not None and rows_ep:
             _flush_episode_checkpoint(args.out_dir, current_ep_id, rows_ep, actions_ep)
+        if current_ep_id is not None and len(rows_ep) == 0:
+            logging.info("Skipped episode %s (no states collected).", current_ep_id)
     
     # =========================================================
     # final flush / save

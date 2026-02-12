@@ -53,6 +53,139 @@ from plotly.subplots import make_subplots
 from matplotlib.lines import Line2D
 from plotly.colors import qualitative
 
+DT_DEFAULT = 1.0 / 15.0
+
+def _slice_vec(v, sl):
+    v = np.asarray(v, dtype=float).reshape(-1)
+    if sl is None:
+        return v
+    if isinstance(sl, (list, tuple, np.ndarray)):
+        return v[np.asarray(sl, dtype=int)]
+    # assume slice
+    return v[sl]
+
+def integrate_q_from_qdot(q0, qdot_seq, dt=DT_DEFAULT):
+    """
+    q0: (J,) initial joint positions
+    qdot_seq: (T, J) joint velocities
+    returns q_seq: (T, J) joint positions at each timestep (aligned to qdot rows)
+      q_seq[t] = q0 + cumsum(qdot_seq[:t+1] * dt)
+    """
+    q0 = np.asarray(q0, dtype=float).reshape(-1)
+    qdot_seq = np.asarray(qdot_seq, dtype=float)
+    if qdot_seq.ndim != 2:
+        raise ValueError(f"qdot_seq must be 2D, got {qdot_seq.shape}")
+    if qdot_seq.shape[1] != q0.shape[0]:
+        raise ValueError(f"Dim mismatch: q0 has {q0.shape[0]} joints but qdot has {qdot_seq.shape[1]} dims")
+
+    dq = np.cumsum(qdot_seq * float(dt), axis=0)
+    return q0[None, :] + dq
+
+def build_joint_position_points_from_actions(
+    actions_state_arr,          # either (Kc,Tc,A) or (T,A)
+    q0_joint,                   # (J,) initial joint positions for THIS state/time
+    action_joint_slice=slice(0,7),
+    dt=DT_DEFAULT
+):
+    """
+    Returns:
+      Q_points: (N_points, J) joint positions for plotting
+      chunk_ids: (N_points,)
+      time_ids:  (N_points,)
+    """
+    arr = np.asarray(actions_state_arr, dtype=float)
+
+    if arr.ndim == 3:
+        Kc, Tc, A = arr.shape
+        # per chunk integrate using same q0 (or you can customize per chunk if you have it)
+        Q_all = []
+        chunk_ids = []
+        time_ids = []
+        for c in range(Kc):
+            qdot = np.asarray(arr[c][:, action_joint_slice], dtype=float)
+            q_seq = integrate_q_from_qdot(q0_joint, qdot, dt=dt)  # (Tc,J)
+            Q_all.append(q_seq)
+            chunk_ids.append(np.full(Tc, c, dtype=int))
+            time_ids.append(np.arange(Tc, dtype=int))
+        Q_points = np.vstack(Q_all)
+        chunk_ids = np.concatenate(chunk_ids)
+        time_ids = np.concatenate(time_ids)
+        return Q_points, chunk_ids, time_ids
+
+    if arr.ndim == 2:
+        T, A = arr.shape
+        qdot = np.asarray(arr[:, action_joint_slice], dtype=float)  # (T,J)
+        q_seq = integrate_q_from_qdot(q0_joint, qdot, dt=dt)        # (T,J)
+        # treat as one chunk (or each step its own chunk — but “whole trajectory” implies 1 chunk)
+        chunk_ids = np.zeros(T, dtype=int)
+        time_ids = np.arange(T, dtype=int)
+        return q_seq, chunk_ids, time_ids
+
+    raise ValueError(f"Unsupported action shape: {arr.shape}")
+
+def _parse_slice(s):
+    # "0:7" -> slice(0,7); "None" -> None
+    s = str(s).strip()
+    if s.lower() == "none":
+        return None
+    if ":" in s:
+        a, b = s.split(":")
+        a = int(a) if a.strip() else None
+        b = int(b) if b.strip() else None
+        return slice(a, b)
+    # single int means first N dims
+    n = int(s)
+    return slice(0, n)
+
+
+def _integrate_joint_velocity_chunk(chunk, dt, vel_dims=7, include_gripper=True, anchor_start=True):
+    """
+    chunk: (T, A) where first vel_dims are joint velocities.
+    Returns integrated trajectory used by clustering:
+      [dq (T, vel_dims), gripper (T,1)] if include_gripper and available
+      [dq (T, vel_dims)] otherwise
+    """
+    arr = np.asarray(chunk, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(f"chunk must be 2D (T,A), got {arr.shape}")
+    T, A = arr.shape
+    if A < vel_dims:
+        raise ValueError(f"chunk has {A} dims but vel_dims={vel_dims}")
+
+    v = arr[:, :vel_dims]
+    dq = np.cumsum(v * float(dt), axis=0)
+    if anchor_start and T > 1:
+        dq = dq - dq[:1]
+
+    if include_gripper and A >= vel_dims + 1:
+        g = arr[:, vel_dims:vel_dims + 1]
+        return np.hstack([dq, g])
+    return dq
+
+
+def _prepare_integrated_trajectories_from_actions(arr, dt, vel_dims=7, include_gripper=True):
+    """
+    Convert raw actions into integrated trajectories used by mass_droid_clustering.py.
+    Supports:
+      - arr: (K, T, A) -> list length K
+      - arr: (T, A)    -> list length 1
+    """
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim == 3:
+        Kc = arr.shape[0]
+        return [
+            _integrate_joint_velocity_chunk(
+                arr[k], dt=dt, vel_dims=vel_dims, include_gripper=include_gripper, anchor_start=True
+            )
+            for k in range(Kc)
+        ]
+    if arr.ndim == 2:
+        return [
+            _integrate_joint_velocity_chunk(
+                arr, dt=dt, vel_dims=vel_dims, include_gripper=include_gripper, anchor_start=True
+            )
+        ]
+    raise ValueError(f"Unsupported action shape: {arr.shape}")
 # ------------------------------------------------------------
 # Minkowski distance & variance helpers (chunk-based)
 # ------------------------------------------------------------
@@ -114,7 +247,16 @@ def _minkowski_variance_from_D(D):
     D = np.asarray(D, float)
     if D.size == 0:
         return 0.0
-    term1 = float(np.mean(D ** 2))          # E[d^2]
+    if D.ndim != 2 or D.shape[0] != D.shape[1]:
+        raise ValueError(f"D must be square, got {D.shape}")
+
+    n = D.shape[0]
+    if n <= 1:
+        return 0.0
+
+    # Use only off-diagonal pairs to avoid bias from zero self-distances.
+    offdiag = ~np.eye(n, dtype=bool)
+    term1 = float(np.mean((D[offdiag]) ** 2))
     return 0.5 * term1
 
 
@@ -188,13 +330,13 @@ def plot_actions_xyz(
     point_size=2,
     line_width=4.0,
     line_alpha=0.35,
-    # NEW:
-    chunk_start_xyz=None,          # dict: chunk_id -> (3,) start point from real states
-    ghost_visible="true",          # "legendonly" | "true" | "false"
+    chunk_start_xyz=None,
+    ghost_visible="true",
 ):
     """
-    3D scatter of points (actions) + togglable ghost trajectories (lines),
-    and start markers that come from real DROID states.
+    Chunk-consistent plotting:
+    - We compute ONE label per chunk (dominant label within the chunk).
+    - All points within a chunk are colored by that chunk label.
     """
     xyz = np.asarray(xyz)
     labels = np.asarray(labels).reshape(-1)
@@ -207,17 +349,7 @@ def plot_actions_xyz(
     sample_idx = np.array([r[1] for r in index_rows], dtype=int)  # chunk id per point
     action_idx = np.array([r[2] for r in index_rows], dtype=int)  # time id per point
 
-    # Consistent color map on clusters
-    uniq = np.unique(labels)
-    uniq_sorted = np.sort(uniq)
-    palette = qualitative.Dark24 or ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-                                     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
-                                     "#bcbd22", "#17becf"]
-    color_map = {lab: palette[i % len(palette)] for i, lab in enumerate(uniq_sorted)}
-
-    fig = go.Figure()
-
-    # --- build per-chunk ordered polylines + dominant cluster per chunk ---
+    # ---- compute dominant label per chunk (robust even if per-point labels vary) ----
     chunk_ids = np.unique(sample_idx)
     chunk_dom = {}
     chunk_poly = {}  # chunk_id -> (T,3) points in time order
@@ -235,8 +367,19 @@ def plot_actions_xyz(
         chunk_dom[cid] = dom
         chunk_poly[cid] = pts
 
-    # --- ghost trajectories: ONE trace per cluster so it’s legend-togglable ---
-    # (Plotly can’t do multi-color lines inside one trace; grouping by cluster keeps toggles useful.)
+    # per-point labels forced to chunk labels
+    labels_chunk_per_point = np.array([chunk_dom[int(c)] for c in sample_idx], dtype=int)
+
+    # ---- color map (consistent across clusters) ----
+    uniq_sorted = np.sort(np.unique(labels_chunk_per_point))
+    palette = qualitative.Dark24 or ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+                                     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+                                     "#bcbd22", "#17becf"]
+    color_map = {lab: palette[i % len(palette)] for i, lab in enumerate(uniq_sorted)}
+
+    fig = go.Figure()
+
+    # visibility for ghost lines
     if ghost_visible == "legendonly":
         vis = "legendonly"
         show_line_legend = True
@@ -247,24 +390,19 @@ def plot_actions_xyz(
         vis = True
         show_line_legend = False
 
-    # --- per-cluster markers + ghost trajectories tied together in legend groups ---
+    # ---- one marker trace per cluster; chunk-consistent membership ----
     for lab in uniq_sorted:
-        mask = (labels == lab)
+        legend_group = f"cluster-{lab}"
+        color_hex = color_map[lab]
+
+        mask = (labels_chunk_per_point == lab)
         if not np.any(mask):
             continue
 
-        color_hex = color_map[lab]
-        legend_group = f"cluster-{lab}"
-
-        # Markers (points) for this cluster
         fig.add_trace(go.Scatter3d(
             x=xyz[mask, 0], y=xyz[mask, 1], z=xyz[mask, 2],
             mode="markers",
-            marker=dict(
-                size=point_size,
-                color=color_hex,
-                opacity=0.95,
-            ),
+            marker=dict(size=point_size, color=color_hex, opacity=0.95),
             name=f"cluster {lab}",
             legendgroup=legend_group,
             legendgrouptitle_text=f"cluster {lab}",
@@ -272,7 +410,7 @@ def plot_actions_xyz(
             visible=True,
         ))
 
-        # aggregate all chunk polylines for this cluster into one trace using NaN separators
+        # ---- ghost trajectories: all chunks whose dominant label == lab ----
         xs, ys, zs = [], [], []
         used_any = False
         for cid, dom in chunk_dom.items():
@@ -295,78 +433,58 @@ def plot_actions_xyz(
                 name=f"cluster {lab} trajectories",
                 visible=vis,
                 legendgroup=legend_group,
-                showlegend=show_line_legend,  # gives a toggle when requested
+                showlegend=show_line_legend,
             ))
 
-    # --- start markers: REAL DROID states (if provided) ---
+    # ---- start markers (optional) ----
     if chunk_start_xyz is not None:
-        starts_by_cluster = {}
-        connect_by_cluster = {}
         start_legend_shown = False
         for cid, dom in chunk_dom.items():
             if cid not in chunk_start_xyz:
                 continue
             p_start = np.asarray(chunk_start_xyz[cid], dtype=float).reshape(3,)
-            starts_by_cluster.setdefault(dom, set()).add(tuple(p_start.tolist()))
-
-            if cid in chunk_poly:
-                p_first = chunk_poly[cid][0]
-                xs, ys, zs = connect_by_cluster.setdefault(dom, ([], [], []))
-                xs.extend([p_start[0], p_first[0], np.nan])
-                ys.extend([p_start[1], p_first[1], np.nan])
-                zs.extend([p_start[2], p_first[2], np.nan])
-
-        for dom, pts_set in starts_by_cluster.items():
-            pts = np.array(list(pts_set))
-            color_hex = color_map[dom]
+            color_hex = color_map.get(dom, "#000000")
             legend_group = f"cluster-{dom}"
+
             fig.add_trace(go.Scatter3d(
-                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+                x=[p_start[0]], y=[p_start[1]], z=[p_start[2]],
                 mode="markers",
-                marker=dict(
-                    size=9,
-                    symbol="diamond",
-                    color=color_hex,
-                    opacity=0.98,
-                    line=dict(width=2, color="#000000"),
-                ),
+                marker=dict(size=9, symbol="diamond", color=color_hex,
+                            opacity=0.98, line=dict(width=2, color="#000000")),
                 name="start state (DROID)",
                 legendgroup=legend_group,
                 showlegend=not start_legend_shown,
             ))
             start_legend_shown = True
 
-        for dom, (xs, ys, zs) in connect_by_cluster.items():
-            color_hex = color_map[dom]
-            legend_group = f"cluster-{dom}"
-            fig.add_trace(go.Scatter3d(
-                x=xs, y=ys, z=zs,
-                mode="lines",
-                line=dict(width=3, color=color_hex, dash="dot"),
-                opacity=0.6,
-                name="start to first action",
-                legendgroup=legend_group,
-                showlegend=False,
-            ))
+            # dotted connection from start->first action
+            if cid in chunk_poly and chunk_poly[cid].shape[0] > 0:
+                p_first = chunk_poly[cid][0]
+                fig.add_trace(go.Scatter3d(
+                    x=[p_start[0], p_first[0]],
+                    y=[p_start[1], p_first[1]],
+                    z=[p_start[2], p_first[2]],
+                    mode="lines",
+                    line=dict(width=3, color=color_hex, dash="dot"),
+                    opacity=0.6,
+                    name="start to first action",
+                    legendgroup=legend_group,
+                    showlegend=False,
+                ))
 
-    # --- end markers (optional; still based on action trajectory endpoints) ---
+    # ---- chunk endpoints (optional) ----
     ends_by_cluster = {}
     for cid, dom in chunk_dom.items():
         pts = chunk_poly[cid]
         ends_by_cluster.setdefault(dom, []).append(pts[-1])
     for dom, pts in ends_by_cluster.items():
         pts = np.stack(pts, axis=0)
-        color_hex = color_map[dom]
+        color_hex = color_map.get(dom, "#000000")
         legend_group = f"cluster-{dom}"
         fig.add_trace(go.Scatter3d(
             x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
             mode="markers",
-            marker=dict(
-                size=3,
-                symbol="x",
-                color=color_hex,
-                opacity=0.9,
-            ),
+            marker=dict(size=3, symbol="x", color=color_hex, opacity=0.9),
             name="chunk endpoints",
             legendgroup=legend_group,
             showlegend=False,
@@ -378,14 +496,15 @@ def plot_actions_xyz(
         margin=dict(l=0, r=0, b=0, t=40),
         legend=dict(itemsizing="constant"),
     )
-
     fig.write_html(html_path)
+
 
 def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters,
                             html_path, title_prefix="State",
                             point_size=2, line_width=4.0, line_alpha=0.6):
     """
-    Plotly multi-panel (subplots) 3D visualization: one scene per cluster.
+    Plotly multi-panel 3D visualization: one scene per cluster.
+    Colors are chunk-consistent: whole chunks are colored by their (dominant) cluster.
     """
     xyz = np.asarray(xyz)
     labels = np.asarray(per_point_labels).reshape(-1)
@@ -394,38 +513,45 @@ def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters,
     sample_idx = np.array([r[1] for r in index_rows], dtype=int)
     action_idx = np.array([r[2] for r in index_rows], dtype=int)
 
-    uniq_clusters = np.unique(labels)
-    C = int(max(n_clusters, uniq_clusters.max() + 1))
+    # dominant label per chunk
+    chunk_ids = np.unique(sample_idx)
+    chunk_to_cluster = {}
+    for cid in chunk_ids:
+        m = (sample_idx == cid)
+        if not np.any(m):
+            continue
+        vals, counts = np.unique(labels[m], return_counts=True)
+        chunk_to_cluster[cid] = int(vals[np.argmax(counts)])
 
-    cols = min(4, C)
-    rows = int(np.ceil(C / cols))
+    uniq_clusters = np.unique(list(chunk_to_cluster.values())) if chunk_to_cluster else np.array([], dtype=int)
+    C = int(max(n_clusters, (uniq_clusters.max() + 1) if uniq_clusters.size else 0))
+
+    cols = min(4, max(C, 1))
+    rows = int(np.ceil(max(C, 1) / cols))
 
     fig = make_subplots(
         rows=rows,
         cols=cols,
         specs=[[{"type": "scene"} for _ in range(cols)] for _ in range(rows)],
-        subplot_titles=[f"Cluster {ci}" for ci in range(C)],
+        subplot_titles=[f"Cluster {ci}" for ci in range(max(C, 1))],
     )
 
-    # assign each chunk to its dominant cluster
-    chunk_ids = np.unique(sample_idx)
-    chunk_to_cluster = {}
-    for k in chunk_ids:
-        m = (sample_idx == k)
-        if not np.any(m):
-            continue
-        vals, counts = np.unique(labels[m], return_counts=True)
-        chunk_to_cluster[k] = int(vals[np.argmax(counts)])
+    palette = qualitative.Dark24 or ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+                                     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+                                     "#bcbd22", "#17becf"]
+    color_map = {ci: palette[ci % len(palette)] for ci in range(max(C, 1))}
 
-    for ci in range(C):
+    for ci in range(max(C, 1)):
         row_i = ci // cols + 1
         col_i = ci % cols + 1
-        chunks_in_ci = [k for k, lab in chunk_to_cluster.items() if lab == ci]
+        chunks_in_ci = [cid for cid, lab in chunk_to_cluster.items() if lab == ci]
         if not chunks_in_ci:
             continue
 
-        for k in chunks_in_ci:
-            m = (sample_idx == k)
+        color_hex = color_map[ci]
+
+        for cid in chunks_in_ci:
+            m = (sample_idx == cid)
             pts = xyz[m]
             t_ids = action_idx[m]
             order = np.argsort(t_ids)
@@ -433,71 +559,50 @@ def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters,
             if pts.shape[0] == 0:
                 continue
 
-            # points
             fig.add_trace(
                 go.Scatter3d(
-                    x=pts[:, 0],
-                    y=pts[:, 1],
-                    z=pts[:, 2],
+                    x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                     mode="markers",
-                    marker=dict(size=point_size),
+                    marker=dict(size=point_size, color=color_hex),
                     opacity=0.95,
                     showlegend=False,
                 ),
-                row=row_i,
-                col=col_i,
+                row=row_i, col=col_i,
             )
 
-            # line
             if pts.shape[0] >= 2:
                 fig.add_trace(
                     go.Scatter3d(
-                        x=pts[:, 0],
-                        y=pts[:, 1],
-                        z=pts[:, 2],
+                        x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                         mode="lines",
-                        line=dict(width=line_width),
+                        line=dict(width=line_width, color=color_hex),
                         opacity=line_alpha,
                         showlegend=False,
                     ),
-                    row=row_i,
-                    col=col_i,
+                    row=row_i, col=col_i,
                 )
 
             # start / end markers
-            p0 = pts[0]
-            p1 = pts[-1]
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[p0[0]],
-                    y=[p0[1]],
-                    z=[p0[2]],
-                    mode="markers",
-                    marker=dict(symbol="circle-open", size=3, line=dict(width=1)),
-                    showlegend=False,
-                ),
-                row=row_i,
-                col=col_i,
-            )
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[p1[0]],
-                    y=[p1[1]],
-                    z=[p1[2]],
-                    mode="markers",
-                    marker=dict(symbol="x", size=3),
-                    showlegend=False,
-                ),
-                row=row_i,
-                col=col_i,
-            )
+            p0, p1 = pts[0], pts[-1]
+            fig.add_trace(go.Scatter3d(
+                x=[p0[0]], y=[p0[1]], z=[p0[2]],
+                mode="markers",
+                marker=dict(symbol="circle-open", size=3, line=dict(width=1, color="#000000")),
+                showlegend=False,
+            ), row=row_i, col=col_i)
+            fig.add_trace(go.Scatter3d(
+                x=[p1[0]], y=[p1[1]], z=[p1[2]],
+                mode="markers",
+                marker=dict(symbol="x", size=3, color="#000000"),
+                showlegend=False,
+            ), row=row_i, col=col_i)
 
     fig.update_layout(
         title=f"{title_prefix}: per-cluster chunk views",
         margin=dict(l=0, r=0, b=0, t=40),
     )
-
     fig.write_html(html_path)
+    
 # ------------------------------------------------------------
 # Gaussian mixture trajectory generation + clustering
 # ------------------------------------------------------------
@@ -634,7 +739,74 @@ def load_per_state_file(path):
             best = first
         else:
             best = first.item()
-    return rows, best
+    labels_by_k = None
+    if "labels_by_k" in data and data["labels_by_k"].size > 0:
+        raw = data["labels_by_k"][0]
+        if isinstance(raw, dict):
+            labels_by_k = raw
+        else:
+            try:
+                labels_by_k = raw.item()
+            except Exception:
+                labels_by_k = None
+    return rows, best, labels_by_k
+
+
+def load_labels_for_state_k(state_idx, per_state_dir, k):
+    """
+    Return (labels, used_idx) for a given (state, k), if available.
+    labels: np.ndarray shape (N_chunks_used,)
+    used_idx: None or np.ndarray mapping local chunk index -> original chunk index
+    """
+    path = os.path.join(per_state_dir, f"state_{state_idx:06d}.npz")
+    if not os.path.exists(path):
+        return None, None
+
+    rows, best, labels_by_k = load_per_state_file(path)
+
+    used_idx = None
+    if best is not None and isinstance(best, dict):
+        idx = best.get("idx", None)
+        if idx is not None and len(np.asarray(idx).reshape(-1)) > 0:
+            used_idx = np.asarray(idx, dtype=int)
+
+    if labels_by_k:
+        if int(k) in labels_by_k:
+            return np.asarray(labels_by_k[int(k)], dtype=int), used_idx
+        if str(int(k)) in labels_by_k:
+            return np.asarray(labels_by_k[str(int(k))], dtype=int), used_idx
+
+    # Fallbacks for older cache formats.
+    for r in rows:
+        try:
+            if int(r.get("k", -1)) == int(k) and r.get("labels") is not None:
+                return np.asarray(r.get("labels"), dtype=int), used_idx
+        except Exception:
+            continue
+    if best is not None and int(best.get("k", -1)) == int(k) and best.get("labels") is not None:
+        return np.asarray(best.get("labels"), dtype=int), used_idx
+    return None, used_idx
+
+def load_cached_row_for_state(state_idx, per_state_dir, *, k, num_points, action_dim):
+    path = os.path.join(per_state_dir, f"state_{state_idx:06d}.npz")
+    if not os.path.exists(path):
+        return None
+    rows, best, _ = load_per_state_file(path)
+    # rows is a list of dicts produced by the clustering script
+    for r in rows:
+        try:
+            if int(r.get("k", -1)) != int(k):
+                continue
+            if int(r.get("num_points", -1)) != int(num_points):
+                continue
+            if int(r.get("action_dim", -1)) != int(action_dim):
+                continue
+            if r.get("labels") is None:
+                continue
+            return r
+        except Exception:
+            continue
+    return None
 
 import re, glob
 
@@ -924,9 +1096,98 @@ def gaussian_baseline_ratio(num_chunks,
             continue
 
         wvar = weighted_incluster_variance_minkowski(D_mink, labels)
-        ratios.append((tv - wvar) / tv)
+        ratio = (tv - wvar) / tv
+        ratios.append(float(np.clip(ratio, 0.0, 1.0)))
 
     return float(np.mean(ratios)) if ratios else 0.0
+
+
+def _cluster_binary_drop_ratios_from_D(D_mink, labels):
+    """
+    Per-cluster "separate vs rest" contribution:
+      For each cluster c, treat partition as [c] vs [not c], and compute
+      drop_ratio_c = (TV - WVAR_binary_c) / TV.
+    """
+    labels = np.asarray(labels, dtype=int).reshape(-1)
+    N = D_mink.shape[0]
+    if N == 0 or labels.shape[0] != N:
+        return np.array([], dtype=float)
+
+    tv = total_variance_minkowski(D_mink)
+    if tv <= 0:
+        return np.array([], dtype=float)
+
+    out = []
+    uniq = np.unique(labels)
+    for c in uniq:
+        idx_c = np.where(labels == c)[0]
+        n_c = idx_c.size
+        if n_c == 0:
+            continue
+        idx_rest = np.where(labels != c)[0]
+
+        Dc = D_mink[np.ix_(idx_c, idx_c)]
+        var_c = _minkowski_variance_from_D(Dc)
+
+        if idx_rest.size > 0:
+            Drest = D_mink[np.ix_(idx_rest, idx_rest)]
+            var_rest = _minkowski_variance_from_D(Drest)
+        else:
+            var_rest = 0.0
+
+        wvar_binary = (n_c / N) * var_c + (idx_rest.size / N) * var_rest
+        ratio_c = (tv - wvar_binary) / tv
+        out.append(float(np.clip(ratio_c, 0.0, 1.0)))
+    return np.asarray(out, dtype=float)
+
+
+def gaussian_baseline_cluster_avg_ratio(num_chunks,
+                                        per_step_dim,
+                                        chunk_len,
+                                        k_cluster,
+                                        n_modes,
+                                        v_scales,
+                                        n_trials=30,
+                                        rng=None,
+                                        sigma=None):
+    """
+    Gaussian baseline for cluster-level thresholding:
+      average over trials of mean per-cluster binary drop ratio.
+    """
+    if rng is None:
+        rng = np.random.RandomState(0)
+
+    v_scales = np.asarray(v_scales, dtype=float)
+    if chunk_len <= 0:
+        return 0.0
+    if v_scales.shape[0] != chunk_len:
+        if v_scales.shape[0] > chunk_len:
+            v_scales = v_scales[:chunk_len]
+        else:
+            v_scales = np.pad(v_scales, (0, chunk_len - v_scales.shape[0]), mode="edge")
+
+    trial_vals = []
+    for _ in range(n_trials):
+        trajectories, _ = _generate_gaussian_mixture_trajectories_iid_per_timestep(
+            num_chunks=num_chunks,
+            per_step_dim=per_step_dim,
+            chunk_len=chunk_len,
+            n_modes=n_modes,
+            v_scales=v_scales,
+            rng=rng,
+            sep=3.0,
+        )
+
+        labels, D_mink = _cluster_chunks_spectral_from_minkowski(
+            trajectories, k_cluster=k_cluster, sigma=sigma, random_state=0
+        )
+        if labels is None:
+            continue
+        ratios_c = _cluster_binary_drop_ratios_from_D(D_mink, labels)
+        if ratios_c.size == 0:
+            continue
+        trial_vals.append(float(np.mean(ratios_c)))
+    return float(np.mean(trial_vals)) if trial_vals else 0.0
 
 # ------------------------------------------------------------
 # main
@@ -946,7 +1207,17 @@ def main():
     ap.add_argument("--gaussian_max_points", type=int, default=3000)  # kept for API compatibility, not used now
     ap.add_argument("--gaussian_multiplier", type=float, default=1.0,
                     help="threshold = multiplier * gaussian_baseline_ratio")
-    ap.add_argument("--plot_pass_top", type=int, default=10,
+    ap.add_argument("--threshold_mode", type=str, default="global_ratio",
+                    choices=["global_ratio", "cluster_count"],
+                    help="global_ratio: old behavior using state-level variance_drop_ratio; "
+                         "cluster_count: per-cluster separate-vs-rest drop count threshold.")
+    ap.add_argument("--cluster_compare", type=str, default="lte", choices=["lte", "gte"],
+                    help="When threshold_mode=cluster_count, cluster passes if ratio is <= or >= "
+                         "multiplier*cluster_baseline.")
+    ap.add_argument("--cluster_pass_min", type=int, default=1,
+                    help="When threshold_mode=cluster_count, state passes if at least this many "
+                         "clusters pass the per-cluster threshold.")
+    ap.add_argument("--plot_pass_top", type=int, default=3,
                     help="visualize first N passing rows")
     ap.add_argument("--sigma", type=float, default=None,
                     help="sigma for RBF kernel; if None, use median heuristic")
@@ -963,6 +1234,22 @@ def main():
                          "metrics t_in_episode is offset from parquet frame_index.")
     ap.add_argument("--ghost_visible", type=str, default="true",
                     choices=["true", "legendonly", "false"])
+    ap.add_argument("--dt", type=float, default=1.0/15.0, help="Dataset timestep in seconds (15Hz => 1/15).")
+    ap.add_argument("--fps", type=float, default=15.0,
+                    help="Control frequency (Hz) used for velocity integration into dq. Overrides dt for baseline prep.")
+    ap.add_argument("--vel_dims", type=int, default=7,
+                    help="Number of joint velocity dims at start of action vector.")
+    ap.add_argument("--no_gripper", action="store_true",
+                    help="If set, exclude gripper dim from integrated baseline trajectories.")
+    ap.add_argument("--state_joint_slice", type=str, default="0:7",
+                    help="Slice for joint positions inside the state vector, e.g. '0:7' or '7:14'.")
+    ap.add_argument("--action_joint_slice", type=str, default="0:7",
+                    help="Slice for joint velocities inside the action vector, e.g. '0:7'.")
+    ap.add_argument("--plot_space", type=str, default="qpos",
+                    choices=["qpos", "action"],
+                    help="Plot in joint-position space (qpos, integrated) or raw action space.")
+    ap.add_argument("--pca_global", action="store_true",
+                    help="Fit one PCA model globally across all plotted points (recommended).")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -973,6 +1260,9 @@ def main():
     actions_data = np.load(args.actions_npz, allow_pickle=True)
     actions_arr = actions_data["actions"]
 
+    state_joint_slice = _parse_slice(args.state_joint_slice)
+    action_joint_slice = _parse_slice(args.action_joint_slice)
+
     # --------------------------------------------------------
     # Compute real variance_drop_ratio for all rows
     # --------------------------------------------------------
@@ -980,11 +1270,15 @@ def main():
     vd = metrics_df["variance_drop"].to_numpy()
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.where(tv > 0, vd / tv, np.nan)
+    ratio = np.where(np.isnan(ratio), np.nan, np.clip(ratio, 0.0, 1.0))
     metrics_df["variance_drop_ratio"] = ratio
+
+    dt_for_baseline = 1.0 / float(args.fps) if args.fps and args.fps > 0 else float(args.dt)
+    include_gripper = not args.no_gripper
 
     # --------------------------------------------------------
     # Build (num_points, action_dim, k) -> (chunk_len, per_step_dim, v_scales)
-    # using a representative state for each combo
+    # from integrated trajectories (same space as mass_droid_clustering.py)
     # --------------------------------------------------------
     combo_to_params = {}
     for _, row in metrics_df.iterrows():
@@ -997,52 +1291,41 @@ def main():
             continue
 
         arr = np.asarray(actions_arr[state_idx])
-        if arr.ndim == 3:
-            # (Kc, Tc, A)
-            Kc, Tc, A = arr.shape
-            chunk_len = Tc
-            per_step_dim = A
-
-            # compute per-time-step variance over all chunks and dims
-            v_t = []
-            for t in range(Tc):
-                slice_t = arr[:, t, :].reshape(-1)
-                v_t.append(np.var(slice_t))
-            v_t = np.asarray(v_t, dtype=float)
-
-            # guard against all-zero variance
-            v_T = v_t[-1] if v_t[-1] > 0 else (np.max(v_t) if np.max(v_t) > 0 else 1.0)
-            # v_t is a variance; we need STD-ratio so that Var(a_t)= (scale_t^2)*Var(w)
-            # and Var(w)=1 at final step, so scale_T must be 1.
-            v_scales = np.sqrt(v_t / v_T)
-
-            # ---- DEBUG PRINT: per time-step variance and scales ----
-            print(
-                f"[combo params] (num_points={Np}, action_dim={d}, k={k}) "
-                f"state={state_idx}, chunk_len={chunk_len}, per_step_dim={per_step_dim}"
+        try:
+            trajs = _prepare_integrated_trajectories_from_actions(
+                arr, dt=dt_for_baseline, vel_dims=int(args.vel_dims), include_gripper=include_gripper
             )
-            print(f"  v_t (variance):   {np.array2string(v_t, precision=4)}")
-            print(f"  std_scales sqrt(v_t/v_T): {np.array2string(v_scales, precision=4)}")
-
-        elif arr.ndim == 2:
-            # (T, A); in the main script, each time step is a 1-step trajectory
-            T_steps, A = arr.shape
-            chunk_len = 1
-            per_step_dim = A
-            v_scales = np.array([1.0], dtype=float)
-
-            print(
-                f"[combo params] (num_points={Np}, action_dim={d}, k={k}) "
-                f"state={state_idx}, chunk_len={chunk_len}, per_step_dim={per_step_dim}"
-            )
-            print("  2D actions: using single-step chunk; v_scales=[1.0]")
-
-        else:
+        except Exception as e:
             sys.stderr.write(
-                f"[warn] state {state_idx}: unsupported action shape {arr.shape}; "
+                f"[warn] state {state_idx}: could not prepare integrated trajectories ({e}); "
                 "skipping this combo for baseline.\n"
             )
             continue
+
+        if not trajs:
+            continue
+        chunk_len = int(trajs[0].shape[0])
+        per_step_dim = int(trajs[0].shape[1])
+        if chunk_len <= 0 or per_step_dim <= 0:
+            continue
+
+        try:
+            traj_stack = np.stack(trajs, axis=0)  # (K, T, D)
+        except Exception:
+            # Fall back if chunk lengths differ (not expected in DROID chunks).
+            min_len = min(int(tr.shape[0]) for tr in trajs)
+            if min_len <= 0:
+                continue
+            traj_stack = np.stack([tr[:min_len] for tr in trajs], axis=0)
+            chunk_len = min_len
+
+        # per-time variance over chunks and dims in integrated space
+        v_t = np.asarray(
+            [np.var(traj_stack[:, t, :].reshape(-1)) for t in range(chunk_len)],
+            dtype=float
+        )
+        v_T = v_t[-1] if v_t[-1] > 0 else (np.max(v_t) if np.max(v_t) > 0 else 1.0)
+        v_scales = np.sqrt(v_t / v_T)
 
         combo_to_params[key] = (chunk_len, per_step_dim, v_scales)
 
@@ -1068,10 +1351,10 @@ def main():
 
     # Cover all k values present in the data so baselines exist for the plotted ks.
     MAX_K = max(10, int(metrics_df["k"].max()))
-    MAX_N = 10
+    MAX_N = max(10, MAX_K)
 
-    combo_to_baseline_ratio = {}  # (Np, d, k, n) -> ratio
-    combo_to_threshold_ratio = {} # (Np, d, k) -> ratio used for threshold (default n=k)
+    combo_to_threshold_ratio = {}  # (Np, d, k) -> global ratio threshold baseline (n=k)
+    combo_to_threshold_cluster_ratio = {}  # (Np, d, k) -> avg per-cluster baseline ratio (n=k)
 
     for (Np, d, k), (chunk_len, per_step_dim, v_scales) in combo_to_params.items():
         if k < 1 or k > MAX_K:
@@ -1097,6 +1380,19 @@ def main():
                 "n_modes": n_modes,
                 "baseline_ratio": base_ratio,
             })
+
+            cluster_base_ratio = gaussian_baseline_cluster_avg_ratio(
+                num_chunks=Np,
+                per_step_dim=per_step_dim,
+                chunk_len=chunk_len,
+                k_cluster=k,
+                n_modes=n_modes,
+                v_scales=v_scales,
+                n_trials=args.gaussian_trials,
+                rng=rng,
+                sigma=args.sigma,
+            )
+            combo_to_baseline_ratio[(Np, d, k, n_modes, "cluster_avg")] = cluster_base_ratio
 
             # viz (must be INSIDE the n_modes loop)
             if viz_count < VIZ_MAX_EXAMPLES and (n_modes == k):
@@ -1142,6 +1438,7 @@ def main():
 
         # threshold baseline should be set OUTSIDE viz, always:
         combo_to_threshold_ratio[(Np, d, k)] = combo_to_baseline_ratio[(Np, d, k, k)]
+        combo_to_threshold_cluster_ratio[(Np, d, k)] = combo_to_baseline_ratio[(Np, d, k, k, "cluster_avg")]
     # --------------------------------------------------------
     # Apply threshold using variance_drop_ratio
     # --------------------------------------------------------
@@ -1149,21 +1446,117 @@ def main():
     pass_mask = []
     ratios = metrics_df["variance_drop_ratio"].to_numpy()
 
+    # Fields used by cluster_count mode; left NaN/False in global_ratio mode.
+    cluster_base_list = []
+    cluster_pass_count = []
+    cluster_total_count = []
+    cluster_threshold_used = []
+
+    trajs_cache = {}   # state_idx -> list of integrated trajectories
+    D_cache = {}       # (state_idx, used_idx_tuple_or_none) -> D_mink
+
     for idx, row in metrics_df.iterrows():
+        state_idx = int(row["state_index"])
         key = (int(row["num_points"]), int(row["action_dim"]), int(row["k"]))
         base_ratio = combo_to_threshold_ratio.get(key, 0.0)
         baseline_list.append(base_ratio)
-        actual_ratio = ratios[idx]
-        passes = (not np.isnan(actual_ratio)) and (actual_ratio >= args.gaussian_multiplier * base_ratio)
-        pass_mask.append(passes)
+
+        if args.threshold_mode == "global_ratio":
+            actual_ratio = ratios[idx]
+            passes = (not np.isnan(actual_ratio)) and (actual_ratio >= args.gaussian_multiplier * base_ratio)
+            pass_mask.append(passes)
+            cluster_base_list.append(np.nan)
+            cluster_pass_count.append(0)
+            cluster_total_count.append(0)
+            cluster_threshold_used.append(np.nan)
+            continue
+
+        # cluster_count mode
+        cluster_base = combo_to_threshold_cluster_ratio.get(key, 0.0)
+        cluster_base_list.append(cluster_base)
+        thr = float(args.gaussian_multiplier * cluster_base)
+        cluster_threshold_used.append(thr)
+
+        labels_k, used_idx = load_labels_for_state_k(
+            state_idx, args.per_state_dir, int(row["k"])
+        )
+        if labels_k is None:
+            pass_mask.append(False)
+            cluster_pass_count.append(0)
+            cluster_total_count.append(0)
+            continue
+
+        if state_idx not in trajs_cache:
+            arr = np.asarray(actions_arr[state_idx])
+            try:
+                trajs_full = _prepare_integrated_trajectories_from_actions(
+                    arr, dt=dt_for_baseline, vel_dims=int(args.vel_dims), include_gripper=include_gripper
+                )
+            except Exception:
+                pass_mask.append(False)
+                cluster_pass_count.append(0)
+                cluster_total_count.append(0)
+                continue
+            trajs_cache[state_idx] = trajs_full
+        else:
+            trajs_full = trajs_cache[state_idx]
+
+        use_idx = used_idx
+        if use_idx is not None and len(use_idx) > 0:
+            trajs_used = [trajs_full[j] for j in np.asarray(use_idx, dtype=int)
+                          if 0 <= int(j) < len(trajs_full)]
+            d_key = (state_idx, tuple(np.asarray(use_idx, dtype=int).tolist()))
+        else:
+            trajs_used = trajs_full
+            d_key = (state_idx, None)
+
+        if len(trajs_used) == 0:
+            pass_mask.append(False)
+            cluster_pass_count.append(0)
+            cluster_total_count.append(0)
+            continue
+
+        if d_key not in D_cache:
+            D_cache[d_key] = compute_minkowski_distance_matrix(trajs_used)
+        D_mink = D_cache[d_key]
+
+        if labels_k.shape[0] != D_mink.shape[0]:
+            pass_mask.append(False)
+            cluster_pass_count.append(0)
+            cluster_total_count.append(0)
+            continue
+
+        ratios_c = _cluster_binary_drop_ratios_from_D(D_mink, labels_k)
+        if ratios_c.size == 0:
+            pass_mask.append(False)
+            cluster_pass_count.append(0)
+            cluster_total_count.append(0)
+            continue
+
+        if args.cluster_compare == "lte":
+            num_pass = int(np.sum(ratios_c <= thr))
+        else:
+            num_pass = int(np.sum(ratios_c >= thr))
+        num_total = int(ratios_c.size)
+
+        cluster_pass_count.append(num_pass)
+        cluster_total_count.append(num_total)
+        pass_mask.append(num_pass >= int(args.cluster_pass_min))
 
     metrics_df["gaussian_baseline_ratio"] = baseline_list
+    metrics_df["gaussian_cluster_baseline_ratio"] = cluster_base_list
+    metrics_df["cluster_threshold_used"] = cluster_threshold_used
+    metrics_df["cluster_pass_count"] = cluster_pass_count
+    metrics_df["cluster_total_count"] = cluster_total_count
     metrics_df["pass_gaussian"] = pass_mask
 
     pass_df = metrics_df[metrics_df["pass_gaussian"] == True].copy()  # noqa: E712
-    # sort by "how much it beats" the threshold (in ratio space)
-    pass_df["beat_margin"] = pass_df["variance_drop_ratio"] - \
-        (args.gaussian_multiplier * pass_df["gaussian_baseline_ratio"])
+    # sort by "how much it beats" threshold.
+    if args.threshold_mode == "cluster_count":
+        pass_df["beat_margin"] = pass_df["cluster_pass_count"] - int(args.cluster_pass_min)
+    else:
+        pass_df["beat_margin"] = pass_df["variance_drop_ratio"] - \
+            (args.gaussian_multiplier * pass_df["gaussian_baseline_ratio"])
     pass_df.sort_values("beat_margin", ascending=False, inplace=True)
 
     pass_csv = os.path.join(args.outdir, "gaussian_passes.csv")
@@ -1317,7 +1710,8 @@ def main():
             showextrema=True,
         )
 
-        plt.xticks(x_positions, labels_pt, rotation=45, ha="right")
+        labels_with_n = [f"{pt}\\n(n={n})" for pt, n in zip(labels_pt, ns)]
+        plt.xticks(x_positions, labels_with_n, rotation=45, ha="right")
         plt.ylabel("Variance drop ratio")
         plt.xlabel("Path type (first word of task_name/instruction)")
         plt.title(f"Variance drop ratio by path type | k={k_val}")
@@ -1376,25 +1770,53 @@ def main():
         path = os.path.join(args.per_state_dir, f"state_{state_idx:06d}.npz")
         if not os.path.exists(path):
             return None
-        _, best = load_per_state_file(path)
+        _, best, _ = load_per_state_file(path)
         return best
 
-    top_passes = pass_df.head(args.plot_pass_top)
-    print(f"Plotting first {len(top_passes)} passing rows...")
+    # We will iterate over passes until we successfully plot args.plot_pass_top per k.
+    # Only consider best-k rows (labels are only cached for best-k).
+    # (skipping ones with missing cached labels or other issues).
+    # We do not backfill beyond the top-N per k to avoid over-plotting.
+    CANDIDATE_BUFFER = int(args.plot_pass_top)
+    candidates_source = pass_df
+    if "best_k" in pass_df.columns:
+        candidates_source = pass_df[pass_df["best_k"] == True].copy()  # noqa: E712
+    else:
+        print("[warn] pass_df missing best_k column; plotting may include non-best k rows.")
 
-    # ---- Preload DROID states for the top passes (only if --lerobot_root provided) ----
+    candidates_df = (
+        candidates_source.sort_values("beat_margin", ascending=False)
+        .groupby("k", group_keys=False)
+        .head(CANDIDATE_BUFFER)
+        .copy()
+    )
+
+    ks_to_plot = sorted(candidates_df["k"].unique().tolist())
+    plot_target_per_k = int(args.plot_pass_top)
+    plotted_by_k = {int(k): 0 for k in ks_to_plot}
+
+    print(
+        "Plotting up to "
+        f"{plot_target_per_k} passing rows per k "
+        f"(scanning top-{plot_target_per_k} per k across k={ks_to_plot}; "
+        "skipping missing cached labels or clustering failures)..."
+    )
+
+    # ---- Preload DROID states for the candidate buffer (only if --lerobot_root provided) ----
     lerobot_state_map = {}
     state_col_candidates = None
     if args.lerobot_state_col:
         state_col_candidates = [args.lerobot_state_col]
 
     if args.lerobot_root is not None:
-        if "episode_id" not in top_passes.columns or "t_in_episode" not in top_passes.columns:
-            raise ValueError("To use --lerobot_root, metrics_df must contain episode_id and t_in_episode "
-                            "(run your patcher first).")
+        if "episode_id" not in candidates_df.columns or "t_in_episode" not in candidates_df.columns:
+            raise ValueError(
+                "To use --lerobot_root, metrics_df must contain episode_id and t_in_episode "
+                "(run your patcher first)."
+            )
 
         needed_keys = set()
-        for r in top_passes.itertuples():
+        for r in candidates_df.itertuples():
             ep_i = _parse_episode_id_to_index(getattr(r, "episode_id"))
             t_i = int(getattr(r, "t_in_episode"))
             needed_keys.add((ep_i, t_i))
@@ -1406,106 +1828,167 @@ def main():
             max_rows_per_parquet=args.lerobot_max_rows_per_parquet,
             frame_tolerance=max(0, int(args.lerobot_frame_tolerance or 0)),
         )
-        print(f"[lerobot] loaded {len(lerobot_state_map)}/{len(needed_keys)} requested (episode_index,frame_index) states")
+        print(
+            f"[lerobot] loaded {len(lerobot_state_map)}/{len(needed_keys)} "
+            f"requested (episode_index,frame_index) states"
+        )
 
-    for rank, row in enumerate(top_passes.itertuples(), start=1):
-        state_idx = int(row.state_index)
+    plotted = 0
+    skipped = 0
+
+    for cand_rank, row in enumerate(candidates_df.itertuples(), start=1):
         k = int(row.k)
-        print(f"  plotting pass #{rank}: state={state_idx} k={k}")
+        if plotted_by_k.get(k, 0) >= plot_target_per_k:
+            continue
+        if plotted_by_k and all(v >= plot_target_per_k for v in plotted_by_k.values()):
+            break
+
+        state_idx = int(row.state_index)
+        print(f"  candidate #{cand_rank}: state={state_idx} k={k}")
 
         acts_raw = actions_arr[state_idx]
         arr = np.asarray(acts_raw)
 
-        # ---------- reconstruct chunk structure ----------
-        if arr.ndim == 3:
-            # arr: (Kc, Tc, A) = (num_chunks, timesteps, action_dim_per_step)
-            Kc, Tc, A = arr.shape
-            traj_matrix = arr.reshape(Kc * Tc, A)        # per-point features
-            chunk_ids = np.repeat(np.arange(Kc), Tc)     # length Kc*Tc
-            time_ids = np.tile(np.arange(Tc), Kc)        # length Kc*Tc
-        elif arr.ndim == 2:
-            # treat each time step as its own "chunk" of length 1
-            T_steps, A = arr.shape
-            Kc, Tc = T_steps, 1
-            traj_matrix = arr.reshape(Kc * Tc, A)
-            chunk_ids = np.arange(Kc)                    # each point is its own chunk
-            time_ids = np.zeros(Kc, dtype=int)
-        else:
-            sys.stderr.write(f"[warn] skipping state {state_idx}: unsupported shape {arr.shape}\n")
+        # ---- get q0 from lerobot state (required for qpos plotting) ----
+        q0_joint = None
+        svec = None
+        if args.plot_space == "qpos":
+            if args.lerobot_root is None:
+                raise ValueError("plot_space=qpos requires --lerobot_root so we can get q0 joint positions.")
+            ep_i = _parse_episode_id_to_index(getattr(row, "episode_id"))
+            t_i = int(getattr(row, "t_in_episode"))
+            key = (ep_i, t_i)
+            if key not in lerobot_state_map:
+                skipped += 1
+                print(f"    [skip] missing lerobot state for key={key} (episode,frame).")
+                continue
+            svec = lerobot_state_map[key].reshape(-1)
+            q0_joint = np.asarray(svec[state_joint_slice], dtype=float).reshape(-1)
+
+        # ---- Build plotting points ----
+        try:
+            if args.plot_space == "qpos":
+                X, chunk_ids, time_ids = build_joint_position_points_from_actions(
+                    actions_state_arr=arr,
+                    q0_joint=q0_joint,
+                    action_joint_slice=action_joint_slice,
+                    dt=args.dt,
+                )
+            else:
+                # original behavior: plot action vectors
+                if arr.ndim == 3:
+                    Kc, Tc, A = arr.shape
+                    X = arr.reshape(Kc * Tc, A)
+                    chunk_ids = np.repeat(np.arange(Kc), Tc)
+                    time_ids = np.tile(np.arange(Tc), Kc)
+                elif arr.ndim == 2:
+                    T_steps, A = arr.shape
+                    X = arr.reshape(T_steps, A)
+                    chunk_ids = np.zeros(T_steps, dtype=int)
+                    time_ids = np.arange(T_steps, dtype=int)
+                else:
+                    skipped += 1
+                    print(f"    [skip] unsupported action shape {arr.shape}")
+                    continue
+        except Exception as e:
+            skipped += 1
+            print(f"    [skip] failed building plot points: {e}")
             continue
 
         # index_rows: one entry per point (state_idx, chunk_id, time_id)
-        index_rows = [
-            (state_idx, int(c), int(t))
-            for c, t in zip(chunk_ids, time_ids)
-        ]
+        index_rows = [(state_idx, int(c), int(t)) for c, t in zip(chunk_ids, time_ids)]
 
         # ---------- try to reuse cached best if it matches this k ----------
+        Kc = int(chunk_ids.max() + 1) if len(chunk_ids) else 0
         cached = maybe_load_best_for_state(state_idx)
+        labels_per_point = None
+        ir = index_rows
 
         if cached is not None and int(cached.get("k", -1)) == k and cached.get("labels") is not None:
-            # cached labels are per-chunk
-            chunk_labels_cached = np.asarray(cached["labels"])
-            used_idx = cached.get("idx", None)
+            try:
+                chunk_labels_cached = np.asarray(cached["labels"], dtype=int)
+                used_idx = cached.get("idx", None)
 
-            if used_idx is not None and len(used_idx) > 0:
-                used_idx = np.asarray(used_idx, dtype=int)
-                # build mapping from original chunk index -> label
-                chunk_label_for_orig = np.full(Kc, -1, dtype=int)
-                for local_idx, orig_idx in enumerate(used_idx):
-                    if 0 <= orig_idx < Kc:
-                        chunk_label_for_orig[orig_idx] = chunk_labels_cached[local_idx]
+                if used_idx is not None and len(used_idx) > 0:
+                    used_idx = np.asarray(used_idx, dtype=int)
+                    chunk_label_for_orig = np.full(Kc, -1, dtype=int)
 
-                # keep only points whose chunks were actually clustered
-                mask = chunk_label_for_orig[chunk_ids] >= 0
-                if not np.any(mask):
-                    sys.stderr.write(
-                        f"[warn] No points to plot for state {state_idx} after applying used_idx.\n"
-                    )
-                    continue
+                    # local label i corresponds to original chunk used_idx[i]
+                    for local_i, orig_i in enumerate(used_idx):
+                        if 0 <= orig_i < Kc and local_i < len(chunk_labels_cached):
+                            chunk_label_for_orig[orig_i] = chunk_labels_cached[local_i]
 
-                X = traj_matrix[mask]
-                ir = [index_rows[j] for j in np.where(mask)[0]]
-                labels_per_point = chunk_label_for_orig[chunk_ids[mask]]
-            else:
-                # no subsampling: chunk_labels length should be Kc
-                if chunk_labels_cached.shape[0] != Kc:
-                    sys.stderr.write(
-                        f"[warn] state {state_idx}: expected {Kc} chunk labels, got {chunk_labels_cached.shape[0]}; "
-                        "falling back to reclustering.\n"
-                    )
-                    cached = None  # force recluster below
+                    mask = chunk_label_for_orig[chunk_ids] >= 0
+                    if np.any(mask):
+                        X = X[mask]
+                        ir = [ir[j] for j in np.where(mask)[0]]
+                        chunk_ids = chunk_ids[mask]
+                        time_ids = time_ids[mask]
+                        labels_per_point = chunk_label_for_orig[chunk_ids]
+                    else:
+                        labels_per_point = None
                 else:
-                    X = traj_matrix
-                    ir = index_rows
-                    labels_per_point = chunk_labels_cached[chunk_ids]
-        else:
-            cached = None  # ensure we don't try to use partially
+                    # no subsampling: should be one label per chunk
+                    if chunk_labels_cached.shape[0] == Kc:
+                        labels_per_point = chunk_labels_cached[chunk_ids]
+                    else:
+                        labels_per_point = None
+            except Exception:
+                labels_per_point = None
 
-        # ---------- if no usable cache, recluster at this k on points ----------
-        if cached is None:
-            X = traj_matrix
-            ir = index_rows
-            # simple Euclidean RBF affinity on points (for visualization only)
-            D = cdist(X, X, metric="euclidean")
-            pos = D[D > 0]
-            sigma_used = float(np.median(pos)) if (args.sigma is None and pos.size) else (args.sigma or 1.0)
-            A_mat = np.exp(-D ** 2 / (2.0 * sigma_used ** 2))
-            np.fill_diagonal(A_mat, 1.0)
-
-            cl = SpectralClustering(
-                n_clusters=k,
-                affinity="precomputed",
-                assign_labels="kmeans",
-                random_state=0,
+        if labels_per_point is None:
+            skipped += 1
+            print(
+                f"    [skip] missing cached best labels for state={state_idx} k={k} "
+                f"(per_state missing, best.k != {k}, labels missing, or idx mapping invalid)."
             )
-            labels_per_point = cl.fit_predict(A_mat)
+            continue
 
         # ---------- now X, labels_per_point, ir all have matching length ----------
-        xyz = to_xyz(X, mode=args.ee_mode)
+        pca_model = None
+        if args.ee_mode == "pca" and args.pca_global:
+            # Fit PCA on *all candidate-buffer* points (robust, consistent axes),
+            # but only for states we can actually construct X for.
+            X_pool = []
+            for row2 in candidates_df.itertuples():
+                sidx2 = int(row2.state_index)
+                arr2 = np.asarray(actions_arr[sidx2], dtype=float)
 
+                try:
+                    if args.plot_space == "qpos":
+                        ep2 = _parse_episode_id_to_index(getattr(row2, "episode_id"))
+                        t2 = int(getattr(row2, "t_in_episode"))
+                        key2 = (ep2, t2)
+                        if key2 not in lerobot_state_map:
+                            continue
+                        svec2 = lerobot_state_map[key2].reshape(-1)
+                        q0_2 = np.asarray(svec2[state_joint_slice], dtype=float)
+
+                        X2, _, _ = build_joint_position_points_from_actions(
+                            arr2, q0_2, action_joint_slice=action_joint_slice, dt=args.dt
+                        )
+                    else:
+                        X2 = arr2.reshape(-1, arr2.shape[-1]) if arr2.ndim == 3 else arr2
+
+                    if X2 is not None and np.asarray(X2).ndim == 2 and np.asarray(X2).shape[0] >= 1:
+                        X_pool.append(np.asarray(X2))
+                except Exception:
+                    continue
+
+            X_pool = np.vstack(X_pool) if X_pool else None
+            if X_pool is not None and X_pool.shape[0] >= 3:
+                pca_model = PCA(n_components=3, random_state=0).fit(X_pool)
+
+        if args.ee_mode == "pca" and not args.pca_global:
+            if X.shape[0] >= 3:
+                pca_model = PCA(n_components=3, random_state=0).fit(X)
+
+        xyz = to_xyz(X, mode=args.ee_mode, pca_model=pca_model)
+
+        plotted += 1
+        plotted_by_k[k] = plotted_by_k.get(k, 0) + 1
         subdir = os.path.join(
-            plot_dir, f"pass{rank:02d}_state_{state_idx:06d}_k{k:02d}"
+            plot_dir, f"state_{state_idx:06d}_k{k:02d}"
         )
         os.makedirs(subdir, exist_ok=True)
         overview_html = os.path.join(subdir, "overview.html")
@@ -1517,22 +2000,20 @@ def main():
             f"gauss={row.gaussian_baseline_ratio:.4f} | "
             f"margin={row.beat_margin:.4f}"
         )
-        
+
         chunk_start_xyz = None
         if args.lerobot_root is not None:
-            ep_i = _parse_episode_id_to_index(getattr(row, "episode_id"))
-            t_i = int(getattr(row, "t_in_episode"))
-            key = (ep_i, t_i)
-            if key not in lerobot_state_map:
-                print(f"[lerobot][warn] missing state for {key} (ep={ep_i}, t={t_i}); no start marker")
+            # if plotting qpos, use q0_joint; else use raw svec (old behavior)
+            if args.plot_space == "qpos" and q0_joint is not None:
+                sxyz = to_xyz(q0_joint.reshape(1, -1), mode=args.ee_mode, pca_model=pca_model)[0]
             else:
-                svec = lerobot_state_map[key]  # (S,)
+                # if plot_space != qpos, svec may be None; only do this if we have it
+                if svec is not None:
+                    sxyz = to_xyz(svec.reshape(1, -1), mode="first3")[0]
+                else:
+                    sxyz = None
 
-                # project to 3D
-                sxyz = to_xyz(svec.reshape(1, -1), mode="first3")[0]
-
-                # IMPORTANT: one real DROID state per plotted state_idx.
-                # We mark it as the "origin" for ALL chunks (same start marker).
+            if sxyz is not None:
                 chunk_start_xyz = {int(c): np.asarray(sxyz, float) for c in range(Kc)}
 
         plot_actions_xyz(
@@ -1547,6 +2028,7 @@ def main():
             chunk_start_xyz=chunk_start_xyz,
             ghost_visible=args.ghost_visible,
         )
+
         n_cls = len(np.unique(labels_per_point))
         plot_per_cluster_panels(
             xyz,
@@ -1560,8 +2042,10 @@ def main():
             line_alpha=0.55,
         )
 
-    print(f"Plots written under: {os.path.abspath(plot_dir)}")
+        print(f"    [ok] plotted as pass #{plotted}: {subdir}")
 
+    print(f"[viz] plotted={plotted}, skipped={skipped}")
+    print(f"Plots written under: {os.path.abspath(plot_dir)}")
 
 if __name__ == "__main__":
     main()
