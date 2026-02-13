@@ -39,6 +39,8 @@ We:
 import argparse
 import os
 import sys
+import glob
+import bisect
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -54,6 +56,103 @@ from matplotlib.lines import Line2D
 from plotly.colors import qualitative
 
 DT_DEFAULT = 1.0 / 15.0
+
+
+def _npz_actions_len(npz_path):
+    data = np.load(npz_path, allow_pickle=True)
+    if "actions" not in data:
+        return 0
+    return int(len(data["actions"]))
+
+
+class _LazyActionsFromNpzRanges:
+    """
+    Memory-light indexable actions dataset over many checkpoint NPZ files.
+    Supports len() and __getitem__(int), matching usage in this script.
+    """
+    def __init__(self, npz_paths):
+        self._npz_paths = list(npz_paths)
+        self._ends = []
+        total = 0
+        for p in self._npz_paths:
+            n = _npz_actions_len(p)
+            total += int(n)
+            self._ends.append(total)
+        self._len = total
+        self._cache_path = None
+        self._cache_actions = None
+
+    def __len__(self):
+        return self._len
+
+    def _load_actions_for_path(self, p):
+        if self._cache_path == p and self._cache_actions is not None:
+            return self._cache_actions
+        data = np.load(p, allow_pickle=True)
+        arr = data["actions"] if "actions" in data else np.array([], dtype=object)
+        self._cache_path = p
+        self._cache_actions = arr
+        return arr
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += self._len
+        if idx < 0 or idx >= self._len:
+            raise IndexError(idx)
+        file_i = bisect.bisect_right(self._ends, idx)
+        start = 0 if file_i == 0 else self._ends[file_i - 1]
+        local_i = idx - start
+        p = self._npz_paths[file_i]
+        arr = self._load_actions_for_path(p)
+        return arr[local_i]
+
+
+def _load_actions_with_fallback(actions_npz_path):
+    """
+    Primary: load merged actions NPZ.
+    Fallback: if missing, lazily index checkpoint NPZs from:
+      - episodes/*/actions.npz
+      - shards/*_actions.npz
+    """
+    if os.path.exists(actions_npz_path):
+        data = np.load(actions_npz_path, allow_pickle=True)
+        return data["actions"]
+
+    root = os.path.dirname(os.path.abspath(actions_npz_path))
+    ep_paths = sorted(glob.glob(os.path.join(root, "episodes", "*", "actions.npz")))
+    shard_paths = sorted(glob.glob(os.path.join(root, "shards", "*_actions.npz")))
+
+    src_paths = ep_paths if ep_paths else shard_paths
+    src_kind = "episodes" if ep_paths else "shards"
+    if not src_paths:
+        raise FileNotFoundError(
+            f"actions_npz not found at '{actions_npz_path}', and no fallback checkpoints under "
+            f"'{root}/episodes/*/actions.npz' or '{root}/shards/*_actions.npz'."
+        )
+
+    valid_paths = []
+    total_states = 0
+    for p in src_paths:
+        try:
+            n = _npz_actions_len(p)
+        except Exception as e:
+            sys.stderr.write(f"[warn] failed reading checkpoint actions npz {p}: {e}\n")
+            continue
+        if n <= 0:
+            continue
+        valid_paths.append(p)
+        total_states += int(n)
+
+    if not valid_paths or total_states <= 0:
+        raise FileNotFoundError(
+            f"Found {len(src_paths)} {src_kind} checkpoint npz files but none had readable 'actions'."
+        )
+
+    sys.stderr.write(
+        f"[warn] '{actions_npz_path}' not found; using lazy fallback from "
+        f"{len(valid_paths)} {src_kind} checkpoint files ({total_states} states).\n"
+    )
+    return _LazyActionsFromNpzRanges(valid_paths)
 
 def _slice_vec(v, sl):
     v = np.asarray(v, dtype=float).reshape(-1)
@@ -1257,8 +1356,7 @@ def main():
         args.per_state_dir = os.path.join(os.path.dirname(args.metrics_csv), "per_state")
 
     metrics_df = pd.read_csv(args.metrics_csv)
-    actions_data = np.load(args.actions_npz, allow_pickle=True)
-    actions_arr = actions_data["actions"]
+    actions_arr = _load_actions_with_fallback(args.actions_npz)
 
     state_joint_slice = _parse_slice(args.state_joint_slice)
     action_joint_slice = _parse_slice(args.action_joint_slice)

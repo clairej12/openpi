@@ -34,7 +34,7 @@ Outputs:
   per-state .npz; per-k rows do not include labels.
 """
 
-import argparse, os, sys
+import argparse, os, sys, glob, bisect
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -61,6 +61,116 @@ def _init_worker(actions_arr, meta_records, args_dict):
     _G_ACTIONS = actions_arr
     _G_META = meta_records
     _G_ARGS = args_dict
+
+
+def _list_actions_from_npz(npz_path):
+    data = np.load(npz_path, allow_pickle=True)
+    if "actions" not in data:
+        return []
+    arr = data["actions"]
+    if arr.size == 0:
+        return []
+    return [arr[i] for i in range(len(arr))]
+
+
+def _npz_actions_len(npz_path):
+    data = np.load(npz_path, allow_pickle=True)
+    if "actions" not in data:
+        return 0
+    return int(len(data["actions"]))
+
+
+class _LazyActionsFromNpzRanges:
+    """
+    Memory-light indexable actions dataset over many checkpoint NPZ files.
+    Supports len() and __getitem__(int), matching usage in this script.
+    """
+    def __init__(self, npz_paths):
+        self._npz_paths = list(npz_paths)
+        self._ends = []
+        total = 0
+        for p in self._npz_paths:
+            n = _npz_actions_len(p)
+            total += int(n)
+            self._ends.append(total)
+        self._len = total
+
+        # Simple single-file cache to avoid repeatedly reopening same episode.
+        self._cache_path = None
+        self._cache_actions = None
+
+    def __len__(self):
+        return self._len
+
+    def _load_actions_for_path(self, p):
+        if self._cache_path == p and self._cache_actions is not None:
+            return self._cache_actions
+        data = np.load(p, allow_pickle=True)
+        arr = data["actions"] if "actions" in data else np.array([], dtype=object)
+        self._cache_path = p
+        self._cache_actions = arr
+        return arr
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += self._len
+        if idx < 0 or idx >= self._len:
+            raise IndexError(idx)
+        file_i = bisect.bisect_right(self._ends, idx)
+        start = 0 if file_i == 0 else self._ends[file_i - 1]
+        local_i = idx - start
+        p = self._npz_paths[file_i]
+        arr = self._load_actions_for_path(p)
+        return arr[local_i]
+
+
+def _load_actions_with_fallback(actions_npz_path):
+    """
+    Primary: load the merged actions NPZ.
+    Fallback: if missing, merge checkpoint NPZs from either:
+      - episodes/*/actions.npz
+      - shards/*_actions.npz
+    """
+    if os.path.exists(actions_npz_path):
+        data = np.load(actions_npz_path, allow_pickle=True)
+        return data["actions"]
+
+    root = os.path.dirname(os.path.abspath(actions_npz_path))
+    ep_paths = sorted(glob.glob(os.path.join(root, "episodes", "*", "actions.npz")))
+    shard_paths = sorted(glob.glob(os.path.join(root, "shards", "*_actions.npz")))
+
+    src_paths = ep_paths if ep_paths else shard_paths
+    src_kind = "episodes" if ep_paths else "shards"
+    if not src_paths:
+        raise FileNotFoundError(
+            f"actions_npz not found at '{actions_npz_path}', and no fallback checkpoints under "
+            f"'{root}/episodes/*/actions.npz' or '{root}/shards/*_actions.npz'."
+        )
+
+    # Validate files and build lazy index (incremental loading on access).
+    valid_paths = []
+    total_states = 0
+    for p in src_paths:
+        try:
+            n = _npz_actions_len(p)
+        except Exception as e:
+            sys.stderr.write(f"[warn] failed reading checkpoint actions npz {p}: {e}\n")
+            continue
+        if n <= 0:
+            continue
+        valid_paths.append(p)
+        total_states += int(n)
+
+    if not valid_paths or total_states <= 0:
+        raise FileNotFoundError(
+            f"Found {len(src_paths)} {src_kind} checkpoint npz files but none had readable 'actions'."
+        )
+
+    sys.stderr.write(
+        f"[warn] '{actions_npz_path}' not found; using lazy fallback from "
+        f"{len(valid_paths)} {src_kind} checkpoint files ({total_states} states).\n"
+    )
+    return _LazyActionsFromNpzRanges(valid_paths)
 
 
 # ------------------------------------------------------------------------------------
@@ -834,6 +944,9 @@ def main():
 
     ap.add_argument("--max_states", type=int, default=None,
                     help="Process at most this many states (by index from 0).")
+    ap.add_argument("--aggregate_only", action="store_true",
+                    help="Skip per-state clustering and aggregate outputs from existing "
+                         "outdir/per_state checkpoints only.")
 
     # NEW: integration params
     ap.add_argument("--fps", type=float, default=15.0,
@@ -850,8 +963,7 @@ def main():
 
     # load data
     meta_df = pd.read_csv(args.summary_csv)
-    data = np.load(args.actions_npz, allow_pickle=True)
-    actions_arr = data["actions"]
+    actions_arr = _load_actions_with_fallback(args.actions_npz)
     N_states = len(actions_arr)
 
     if len(meta_df) != N_states:
@@ -891,7 +1003,9 @@ def main():
 
     best_labels_cache = {}
 
-    if args.n_jobs == 1:
+    if args.aggregate_only:
+        print("Aggregate-only mode: skipping per-state clustering and using existing checkpoints.")
+    elif args.n_jobs == 1:
         _init_worker(actions_arr, meta_records, worker_args)
         for i in range(N_effective):
             if i % 50 == 0:
@@ -921,8 +1035,10 @@ def main():
         state_path = _state_file_path(per_state_dir, i)
         if not os.path.exists(state_path):
             continue
-        rows_i, _ = _load_state_file(state_path)
+        rows_i, best_i = _load_state_file(state_path)
         all_rows.extend(rows_i)
+        if best_i is not None and "state_index" in best_i:
+            best_labels_cache[int(best_i["state_index"])] = best_i
 
     if not all_rows:
         print("No rows computed — check inputs.")
