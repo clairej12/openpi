@@ -34,7 +34,7 @@ Outputs:
   per-state .npz; per-k rows do not include labels.
 """
 
-import argparse, os, sys, glob, bisect
+import argparse, os, sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -42,10 +42,18 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import silhouette_score
 from sklearn.decomposition import PCA
 from sklearn.cluster import SpectralClustering
-from scipy.spatial.distance import cdist
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import plotly.graph_objects as go
 import pdb
+
+from clustering_shared import (
+    as_2d as _as_2d,
+    compute_minkowski_distance_matrix,
+    load_actions_with_fallback as _load_actions_with_fallback,
+    prepare_trajectories_and_features_from_actions as _prepare_trajectories_and_features_from_actions,
+    total_variance_minkowski,
+    weighted_incluster_variance_minkowski,
+)
 
 # ------------------------------------------------------------------------------------
 # Globals for worker processes (set once by initializer)
@@ -71,256 +79,6 @@ def _list_actions_from_npz(npz_path):
     if arr.size == 0:
         return []
     return [arr[i] for i in range(len(arr))]
-
-
-def _npz_actions_len(npz_path):
-    data = np.load(npz_path, allow_pickle=True)
-    if "actions" not in data:
-        return 0
-    return int(len(data["actions"]))
-
-
-class _LazyActionsFromNpzRanges:
-    """
-    Memory-light indexable actions dataset over many checkpoint NPZ files.
-    Supports len() and __getitem__(int), matching usage in this script.
-    """
-    def __init__(self, npz_paths):
-        self._npz_paths = list(npz_paths)
-        self._ends = []
-        total = 0
-        for p in self._npz_paths:
-            n = _npz_actions_len(p)
-            total += int(n)
-            self._ends.append(total)
-        self._len = total
-
-        # Simple single-file cache to avoid repeatedly reopening same episode.
-        self._cache_path = None
-        self._cache_actions = None
-
-    def __len__(self):
-        return self._len
-
-    def _load_actions_for_path(self, p):
-        if self._cache_path == p and self._cache_actions is not None:
-            return self._cache_actions
-        data = np.load(p, allow_pickle=True)
-        arr = data["actions"] if "actions" in data else np.array([], dtype=object)
-        self._cache_path = p
-        self._cache_actions = arr
-        return arr
-
-    def __getitem__(self, idx):
-        if idx < 0:
-            idx += self._len
-        if idx < 0 or idx >= self._len:
-            raise IndexError(idx)
-        file_i = bisect.bisect_right(self._ends, idx)
-        start = 0 if file_i == 0 else self._ends[file_i - 1]
-        local_i = idx - start
-        p = self._npz_paths[file_i]
-        arr = self._load_actions_for_path(p)
-        return arr[local_i]
-
-
-def _load_actions_with_fallback(actions_npz_path):
-    """
-    Primary: load the merged actions NPZ.
-    Fallback: if missing, merge checkpoint NPZs from either:
-      - episodes/*/actions.npz
-      - shards/*_actions.npz
-    """
-    if os.path.exists(actions_npz_path):
-        data = np.load(actions_npz_path, allow_pickle=True)
-        return data["actions"]
-
-    root = os.path.dirname(os.path.abspath(actions_npz_path))
-    ep_paths = sorted(glob.glob(os.path.join(root, "episodes", "*", "actions.npz")))
-    shard_paths = sorted(glob.glob(os.path.join(root, "shards", "*_actions.npz")))
-
-    src_paths = ep_paths if ep_paths else shard_paths
-    src_kind = "episodes" if ep_paths else "shards"
-    if not src_paths:
-        raise FileNotFoundError(
-            f"actions_npz not found at '{actions_npz_path}', and no fallback checkpoints under "
-            f"'{root}/episodes/*/actions.npz' or '{root}/shards/*_actions.npz'."
-        )
-
-    # Validate files and build lazy index (incremental loading on access).
-    valid_paths = []
-    total_states = 0
-    for p in src_paths:
-        try:
-            n = _npz_actions_len(p)
-        except Exception as e:
-            sys.stderr.write(f"[warn] failed reading checkpoint actions npz {p}: {e}\n")
-            continue
-        if n <= 0:
-            continue
-        valid_paths.append(p)
-        total_states += int(n)
-
-    if not valid_paths or total_states <= 0:
-        raise FileNotFoundError(
-            f"Found {len(src_paths)} {src_kind} checkpoint npz files but none had readable 'actions'."
-        )
-
-    sys.stderr.write(
-        f"[warn] '{actions_npz_path}' not found; using lazy fallback from "
-        f"{len(valid_paths)} {src_kind} checkpoint files ({total_states} states).\n"
-    )
-    return _LazyActionsFromNpzRanges(valid_paths)
-
-
-# ------------------------------------------------------------------------------------
-# Velocity->position integration helpers (NEW)
-# ------------------------------------------------------------------------------------
-
-def _integrate_joint_velocity_chunk(chunk, dt, vel_dims=7, include_gripper=True, anchor_start=True):
-    """
-    chunk: (T, A) where A>=vel_dims and typically A==8 (7 vel + 1 gripper pos)
-    Returns a (T, D) trajectory used for distance/clustering/plotting:
-      [integrated_displacement (T, vel_dims), gripper_position (T,1)]  if include_gripper
-      [integrated_displacement (T, vel_dims)]                         otherwise
-    """
-    arr = np.asarray(chunk, dtype=float)
-    if arr.ndim != 2:
-        raise ValueError(f"chunk must be 2D (T,A), got {arr.shape}")
-    T, A = arr.shape
-    if A < vel_dims:
-        raise ValueError(f"chunk has {A} dims but vel_dims={vel_dims}")
-
-    v = arr[:, :vel_dims]  # joint velocities
-    dq = np.cumsum(v * float(dt), axis=0)  # integrated displacement
-
-    # Optionally anchor start at 0 so distances reflect SHAPE, not absolute offset.
-    # For T==1, anchoring would erase the signal, so only anchor when T>1.
-    if anchor_start and T > 1:
-        dq = dq - dq[:1]
-
-    if include_gripper and A >= vel_dims + 1:
-        g = arr[:, vel_dims:vel_dims + 1]  # gripper position (NOT integrated)
-        return np.hstack([dq, g])
-    return dq
-
-
-def _prepare_trajectories_and_features_from_actions(arr, dt, vel_dims=7, include_gripper=True):
-    """
-    Converts raw actions (either (K,T,A) or (T,A)) into:
-      trajectories: list of (T_i, D) arrays (integrated)
-      X_feat:       (N_chunks, flat_dim) for silhouette/CH
-      plot_matrix:  per-point matrix for plotting (sum(T_i), D)
-      chunk_ids, time_ids: per-point indexing (len = sum(T_i))
-    """
-    if arr.ndim == 3:
-        Kc, Tc, A = arr.shape
-        trajs = []
-        for k in range(Kc):
-            trajs.append(_integrate_joint_velocity_chunk(
-                arr[k], dt=dt, vel_dims=vel_dims,
-                include_gripper=include_gripper, anchor_start=True
-            ))
-        # features for silhouette: flatten each integrated chunk
-        D = trajs[0].shape[1] if trajs else (vel_dims + (1 if include_gripper else 0))
-        X_feat = np.stack([tr.reshape(-1) for tr in trajs], axis=0).astype(float)
-
-        # plotting matrix: all time points stacked
-        plot_matrix = np.vstack(trajs).astype(float)
-        chunk_ids = np.repeat(np.arange(Kc), Tc)
-        time_ids = np.tile(np.arange(Tc), Kc)
-        return trajs, X_feat, plot_matrix, chunk_ids, time_ids
-
-    raise ValueError(f"Unsupported actions shape: {arr.shape}")
-
-
-# ------------------------------------------------------------------------------------
-# distance + spectral clustering helpers
-# ------------------------------------------------------------------------------------
-
-def _as_2d(x):
-    x = np.asarray(x)
-    if x.ndim == 1:
-        return x.reshape(-1, 1).astype(float, copy=False)
-    if x.ndim >= 3:
-        x = x.reshape(x.shape[0], -1)
-    return x.astype(float, copy=False)
-
-
-def symmetrized_l2_minkowski_traj(X, Y):
-    """
-    X: (T_x, D)  Y: (T_y, D)
-    d1^2 = sum_i min_j ||x_i - y_j||^2
-    d2^2 = sum_j min_i ||y_j - x_i||^2
-    d = sqrt( (d1^2 + d2^2) / 2 )
-    """
-    X = _as_2d(X)
-    Y = _as_2d(Y)
-    if X.shape[0] == 0 and Y.shape[0] == 0:
-        return 0.0
-    if X.shape[0] == 0 or Y.shape[0] == 0:
-        return np.inf
-
-    dists_sq = cdist(X, Y, metric="sqeuclidean")  # (T_x, T_y)
-    d1_sq = np.sum(np.min(dists_sq, axis=1))
-    d2_sq = np.sum(np.min(dists_sq, axis=0))
-    return float(np.sqrt(0.5 * (d1_sq + d2_sq)))
-
-
-def compute_minkowski_distance_matrix(trajectories):
-    """
-    trajectories: list of arrays, each (T_i, D)
-    Returns D[i,j] = symmetrized_l2_minkowski_traj(traj_i, traj_j)
-    """
-    N = len(trajectories)
-    D = np.zeros((N, N), dtype=float)
-    for i in range(N):
-        for j in range(i + 1, N):
-            d = symmetrized_l2_minkowski_traj(trajectories[i], trajectories[j])
-            D[i, j] = D[j, i] = d
-    return D
-
-
-def _minkowski_variance_from_D(D):
-    """
-    Simplified variance proxy used throughout this code:
-      Var := 0.5 * E[d^2]
-    """
-    D = np.asarray(D, float)
-    if D.size == 0:
-        return 0.0
-    if D.ndim != 2 or D.shape[0] != D.shape[1]:
-        raise ValueError(f"D must be square, got {D.shape}")
-
-    n = D.shape[0]
-    if n <= 1:
-        return 0.0
-
-    # Use only off-diagonal pairs to avoid bias from zero self-distances.
-    offdiag = ~np.eye(n, dtype=bool)
-    term1 = float(np.mean((D[offdiag]) ** 2))
-    return 0.5 * term1
-
-
-def total_variance_minkowski(D):
-    return _minkowski_variance_from_D(D)
-
-
-def weighted_incluster_variance_minkowski(D, labels):
-    labels = np.asarray(labels)
-    N = D.shape[0]
-    if N == 0:
-        return 0.0
-
-    wvar = 0.0
-    for c in np.unique(labels):
-        idx = np.where(labels == c)[0]
-        if idx.size == 0:
-            continue
-        Dc = D[np.ix_(idx, idx)]
-        var_c = _minkowski_variance_from_D(Dc)
-        wvar += (idx.size / N) * var_c
-    return float(wvar)
 
 
 # ---- DTW support (unchanged) ----
@@ -703,6 +461,8 @@ def _process_state(i):
     meta_records = _G_META
     args = _G_ARGS
     per_state_dir = args["per_state_dir"]
+    debug_enabled = bool(args.get("debug_wvar", False))
+    debug_vdr_threshold = float(args.get("debug_vdr_threshold", 0.9))
 
     state_path = _state_file_path(per_state_dir, i)
     if os.path.exists(state_path):
@@ -710,6 +470,9 @@ def _process_state(i):
         return rows, best_cache
 
     acts_raw = actions_arr[i]
+    dbg_input_line = None
+    dbg_dist_line = None
+    dbg_aff_line = None
     try:
         arr = np.asarray(acts_raw)
 
@@ -720,6 +483,16 @@ def _process_state(i):
             vel_dims=args["vel_dims"],
             include_gripper=args["include_gripper"],
         )
+        if debug_enabled:
+            traj_lens = [int(t.shape[0]) for t in trajectories]
+            traj_dims = [int(t.shape[1]) for t in trajectories]
+            dbg_input_line = (
+                f"[DEBUG] state={i} input: arr.shape={arr.shape} "
+                f"N_chunks={len(trajectories)} X_feat.shape={X_feat.shape} "
+                f"traj_len[min,max]=({min(traj_lens) if traj_lens else -1},"
+                f"{max(traj_lens) if traj_lens else -1}) "
+                f"traj_dim_set={sorted(set(traj_dims))}"
+            )
     except Exception as e:
         sys.stderr.write(f"[skip] state {i}: {e}\n")
         rows = []
@@ -762,12 +535,30 @@ def _process_state(i):
                 max_workers=args["max_workers"],
             )
 
+        if debug_enabled:
+            pos_dm = D_mink[D_mink > 0]
+            asym = float(np.max(np.abs(D_mink - D_mink.T))) if D_mink.size else 0.0
+            diag_abs_max = float(np.max(np.abs(np.diag(D_mink)))) if D_mink.size else 0.0
+            dbg_dist_line = (
+                f"[DEBUG] state={i} D: shape={D_mink.shape} min={float(np.min(D_mink)) if D_mink.size else np.nan} "
+                f"max={float(np.max(D_mink)) if D_mink.size else np.nan} "
+                f"mean_pos={float(np.mean(pos_dm)) if pos_dm.size else np.nan} "
+                f"asym_max={asym} diag_abs_max={diag_abs_max}"
+            )
+
         pos = D_mink[D_mink > 0]
         sigma_used = float(np.median(pos)) if (args["sigma"] is None and pos.size) else (args["sigma"] or 1.0)
         A = np.exp(-D_mink ** 2 / (2.0 * sigma_used ** 2))
         np.fill_diagonal(A, 1.0)
 
         tv = total_variance_minkowski(D_mink)
+        if debug_enabled:
+            dbg_aff_line = (
+                f"[DEBUG] state={i} affinity: sigma_used={sigma_used} "
+                f"A[min,max]=({float(np.min(A)) if A.size else np.nan},{float(np.max(A)) if A.size else np.nan}) "
+                f"A_diag[min,max]=({float(np.min(np.diag(A))) if A.size else np.nan},"
+                f"{float(np.max(np.diag(A))) if A.size else np.nan}) tv={tv}"
+            )
     except Exception as e:
         sys.stderr.write(f"[skip] state {i}: affinity failed ({e})\n")
         rows = []
@@ -807,13 +598,29 @@ def _process_state(i):
         labels_by_k[int(k)] = labels.copy()
 
         # Minkowski-based variance
-        wvar = weighted_incluster_variance_minkowski(D_mink, labels)
+        wvar = weighted_incluster_variance_minkowski(D_mink, labels, debug=False)
         drop = tv - wvar
         tss = tv
         bss = drop
 
         var_drop_ratio = 0.0 if tss <= 0 else float(np.clip(drop / tss, 0.0, 1.0))
         r2 = var_drop_ratio
+        if debug_enabled and var_drop_ratio >= debug_vdr_threshold:
+            if dbg_input_line is not None:
+                print(dbg_input_line, flush=True)
+            if dbg_dist_line is not None:
+                print(dbg_dist_line, flush=True)
+            if dbg_aff_line is not None:
+                print(dbg_aff_line, flush=True)
+            _ = weighted_incluster_variance_minkowski(D_mink, labels, debug=True)
+            u, cts = np.unique(labels, return_counts=True)
+            sizes = dict(zip(u.tolist(), cts.tolist()))
+            print(
+                f"[DEBUG] state={i} k={k} N_chunks={N_chunks} tv={tss} wvar={wvar} "
+                f"drop={drop} vdr={var_drop_ratio} threshold={debug_vdr_threshold} "
+                f"cluster_sizes={sizes}",
+                flush=True,
+            )
 
         Np = N_chunks
         ch = np.nan
@@ -955,6 +762,10 @@ def main():
                     help="Number of joint-velocity dims at start of action vector.")
     ap.add_argument("--no_gripper", action="store_true",
                     help="If set, ignore gripper dimension in clustering/plotting.")
+    ap.add_argument("--debug_wvar", action="store_true",
+                    help="Print debug info for suspicious high-variance-drop rows.")
+    ap.add_argument("--debug_vdr_threshold", type=float, default=0.9,
+                    help="Only print per-state debug when variance_drop_ratio >= this threshold.")
 
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -995,11 +806,15 @@ def main():
         dt=(1.0 / float(args.fps) if args.fps > 0 else 1.0 / 15.0),
         vel_dims=int(args.vel_dims),
         include_gripper=(not args.no_gripper),
+        debug_wvar=bool(args.debug_wvar),
+        debug_vdr_threshold=float(args.debug_vdr_threshold),
     )
 
     print(f"Processing {N_effective} states (out of {N_states}) with {args.n_jobs} worker(s)...")
     print(f"Integration: fps={args.fps} -> dt={worker_args['dt']:.6f} | vel_dims={worker_args['vel_dims']} | "
           f"include_gripper={worker_args['include_gripper']}")
+    if args.debug_wvar:
+        print(f"Debug filter enabled: variance_drop_ratio >= {args.debug_vdr_threshold}")
 
     best_labels_cache = {}
 
@@ -1094,6 +909,26 @@ def main():
     metrics_df.to_csv(metrics_csv, index=False)
     best_df.head(args.top_n).to_csv(best_csv, index=False)
     print(f"\nSaved:\n- {os.path.abspath(metrics_csv)}\n- {os.path.abspath(best_csv)}")
+
+    if args.debug_wvar:
+        suspicious = metrics_df[
+            (metrics_df["best_k"] == False) &  # noqa: E712
+            (metrics_df["variance_drop_ratio"] >= float(args.debug_vdr_threshold))
+        ].copy()
+        suspicious.sort_values("variance_drop_ratio", ascending=False, inplace=True)
+        suspicious_csv = os.path.join(args.outdir, "suspicious_variance_drop_rows.csv")
+        suspicious.to_csv(suspicious_csv, index=False)
+        print(
+            f"\nSuspicious rows (best_k=False, variance_drop_ratio >= {args.debug_vdr_threshold}): "
+            f"{len(suspicious)}"
+        )
+        if len(suspicious) > 0:
+            cols = [
+                "state_index", "k", "num_points", "total_variance",
+                "weighted_incluster_variance", "variance_drop_ratio"
+            ]
+            print(suspicious[cols].head(50).to_string(index=False))
+        print(f"Saved suspicious rows: {os.path.abspath(suspicious_csv)}")
 
     if args.k_selection == "auc":
         print("\nTop states by k-independent variance_drop_ratio AUC:")
@@ -1194,6 +1029,8 @@ def main():
                 showmeans=True,
                 showextrema=False,
                 widths=0.8,
+                points=30,
+                bw_method=0.2,
             )
             plt.xticks(positions, xticklabels)
             plt.xlabel("Number of clusters (k)")

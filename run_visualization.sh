@@ -14,15 +14,16 @@ OUTDIR=/media/volume/generated_data/pi0_output/droid/droid_1.0.1_lerobot
 #   --summary_csv $OUTDIR/summary.csv \
 #   --actions_npz $OUTDIR/actions.npz \
 #   --outdir $OUTDIR/all_multimodality \
-#   --plot_top_n 50 \
-#   --k_min 2 --k_max 10 \
+#   --plot_top_n 10 \
+#   --k_min 1 --k_max 10 \
 #   --n_jobs 4 \
 #   --best_metric variance_drop_ratio \
 #   --k_selection auc \
-# # optional: add `--aggregate_only` to skip clustering and rebuild outputs from existing checkpoints
-# # optional: add `--max_states <value>` to the command above
-# # --parallel_dtw \
-# # --method dtw \
+#   --debug_wvar
+# optional: add `--aggregate_only` to skip clustering and rebuild outputs from existing checkpoints
+# optional: add `--max_states <value>` to the command above
+# --parallel_dtw \
+# --method dtw \
 
 python droid_gaussian_threshold.py \
   --metrics_csv $OUTDIR/all_multimodality/metrics_per_state.csv \
@@ -36,9 +37,9 @@ python droid_gaussian_threshold.py \
   --ee_mode first3 \
   --lerobot_root /media/volume/droid_data/DROID/droid_1.0.1/ \
   --lerobot_state_col observation.state \
-  # --threshold_mode cluster_count \
-  # --cluster_compare gte \
-  # --pca_global
+  --threshold_mode cluster_count \
+#   # --cluster_compare gte \
+#   # --pca_global
 #
 # # Alternative thresholding mode (per-cluster separate-vs-rest pass count):
 # # python droid_gaussian_threshold.py \

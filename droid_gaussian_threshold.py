@@ -40,7 +40,7 @@ import argparse
 import os
 import sys
 import glob
-import bisect
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -48,111 +48,23 @@ import matplotlib
 
 from sklearn.cluster import SpectralClustering
 from sklearn.decomposition import PCA
-from scipy.spatial.distance import cdist
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from matplotlib.lines import Line2D
 from plotly.colors import qualitative
 
+from clustering_shared import (
+    compute_minkowski_distance_matrix,
+    load_actions_with_fallback as _load_actions_with_fallback,
+    minkowski_variance_from_D,
+    prepare_integrated_trajectories_from_actions as _prepare_integrated_trajectories_from_actions,
+    total_variance_minkowski,
+    weighted_incluster_variance_minkowski,
+)
+
 DT_DEFAULT = 1.0 / 15.0
 
-
-def _npz_actions_len(npz_path):
-    data = np.load(npz_path, allow_pickle=True)
-    if "actions" not in data:
-        return 0
-    return int(len(data["actions"]))
-
-
-class _LazyActionsFromNpzRanges:
-    """
-    Memory-light indexable actions dataset over many checkpoint NPZ files.
-    Supports len() and __getitem__(int), matching usage in this script.
-    """
-    def __init__(self, npz_paths):
-        self._npz_paths = list(npz_paths)
-        self._ends = []
-        total = 0
-        for p in self._npz_paths:
-            n = _npz_actions_len(p)
-            total += int(n)
-            self._ends.append(total)
-        self._len = total
-        self._cache_path = None
-        self._cache_actions = None
-
-    def __len__(self):
-        return self._len
-
-    def _load_actions_for_path(self, p):
-        if self._cache_path == p and self._cache_actions is not None:
-            return self._cache_actions
-        data = np.load(p, allow_pickle=True)
-        arr = data["actions"] if "actions" in data else np.array([], dtype=object)
-        self._cache_path = p
-        self._cache_actions = arr
-        return arr
-
-    def __getitem__(self, idx):
-        if idx < 0:
-            idx += self._len
-        if idx < 0 or idx >= self._len:
-            raise IndexError(idx)
-        file_i = bisect.bisect_right(self._ends, idx)
-        start = 0 if file_i == 0 else self._ends[file_i - 1]
-        local_i = idx - start
-        p = self._npz_paths[file_i]
-        arr = self._load_actions_for_path(p)
-        return arr[local_i]
-
-
-def _load_actions_with_fallback(actions_npz_path):
-    """
-    Primary: load merged actions NPZ.
-    Fallback: if missing, lazily index checkpoint NPZs from:
-      - episodes/*/actions.npz
-      - shards/*_actions.npz
-    """
-    if os.path.exists(actions_npz_path):
-        data = np.load(actions_npz_path, allow_pickle=True)
-        return data["actions"]
-
-    root = os.path.dirname(os.path.abspath(actions_npz_path))
-    ep_paths = sorted(glob.glob(os.path.join(root, "episodes", "*", "actions.npz")))
-    shard_paths = sorted(glob.glob(os.path.join(root, "shards", "*_actions.npz")))
-
-    src_paths = ep_paths if ep_paths else shard_paths
-    src_kind = "episodes" if ep_paths else "shards"
-    if not src_paths:
-        raise FileNotFoundError(
-            f"actions_npz not found at '{actions_npz_path}', and no fallback checkpoints under "
-            f"'{root}/episodes/*/actions.npz' or '{root}/shards/*_actions.npz'."
-        )
-
-    valid_paths = []
-    total_states = 0
-    for p in src_paths:
-        try:
-            n = _npz_actions_len(p)
-        except Exception as e:
-            sys.stderr.write(f"[warn] failed reading checkpoint actions npz {p}: {e}\n")
-            continue
-        if n <= 0:
-            continue
-        valid_paths.append(p)
-        total_states += int(n)
-
-    if not valid_paths or total_states <= 0:
-        raise FileNotFoundError(
-            f"Found {len(src_paths)} {src_kind} checkpoint npz files but none had readable 'actions'."
-        )
-
-    sys.stderr.write(
-        f"[warn] '{actions_npz_path}' not found; using lazy fallback from "
-        f"{len(valid_paths)} {src_kind} checkpoint files ({total_states} states).\n"
-    )
-    return _LazyActionsFromNpzRanges(valid_paths)
 
 def _slice_vec(v, sl):
     v = np.asarray(v, dtype=float).reshape(-1)
@@ -235,157 +147,6 @@ def _parse_slice(s):
     # single int means first N dims
     n = int(s)
     return slice(0, n)
-
-
-def _integrate_joint_velocity_chunk(chunk, dt, vel_dims=7, include_gripper=True, anchor_start=True):
-    """
-    chunk: (T, A) where first vel_dims are joint velocities.
-    Returns integrated trajectory used by clustering:
-      [dq (T, vel_dims), gripper (T,1)] if include_gripper and available
-      [dq (T, vel_dims)] otherwise
-    """
-    arr = np.asarray(chunk, dtype=float)
-    if arr.ndim != 2:
-        raise ValueError(f"chunk must be 2D (T,A), got {arr.shape}")
-    T, A = arr.shape
-    if A < vel_dims:
-        raise ValueError(f"chunk has {A} dims but vel_dims={vel_dims}")
-
-    v = arr[:, :vel_dims]
-    dq = np.cumsum(v * float(dt), axis=0)
-    if anchor_start and T > 1:
-        dq = dq - dq[:1]
-
-    if include_gripper and A >= vel_dims + 1:
-        g = arr[:, vel_dims:vel_dims + 1]
-        return np.hstack([dq, g])
-    return dq
-
-
-def _prepare_integrated_trajectories_from_actions(arr, dt, vel_dims=7, include_gripper=True):
-    """
-    Convert raw actions into integrated trajectories used by mass_droid_clustering.py.
-    Supports:
-      - arr: (K, T, A) -> list length K
-      - arr: (T, A)    -> list length 1
-    """
-    arr = np.asarray(arr, dtype=float)
-    if arr.ndim == 3:
-        Kc = arr.shape[0]
-        return [
-            _integrate_joint_velocity_chunk(
-                arr[k], dt=dt, vel_dims=vel_dims, include_gripper=include_gripper, anchor_start=True
-            )
-            for k in range(Kc)
-        ]
-    if arr.ndim == 2:
-        return [
-            _integrate_joint_velocity_chunk(
-                arr, dt=dt, vel_dims=vel_dims, include_gripper=include_gripper, anchor_start=True
-            )
-        ]
-    raise ValueError(f"Unsupported action shape: {arr.shape}")
-# ------------------------------------------------------------
-# Minkowski distance & variance helpers (chunk-based)
-# ------------------------------------------------------------
-
-def _as_2d(x):
-    x = np.asarray(x)
-    if x.ndim == 1:
-        return x.reshape(-1, 1).astype(float, copy=False)
-    if x.ndim >= 3:
-        x = x.reshape(x.shape[0], -1)
-    return x.astype(float, copy=False)
-
-
-def symmetrized_l2_minkowski_traj(X, Y):
-    """
-    Trajectory-level distance between X and Y.
-
-    X: (T_x, A)
-    Y: (T_y, A)
-
-    d1^2 = sum_i min_j ||x_i - y_j||^2
-    d2^2 = sum_j min_i ||y_j - x_i||^2
-    d   = sqrt( (d1^2 + d2^2) / 2 )
-    """
-    X = _as_2d(X)
-    Y = _as_2d(Y)
-    if X.shape[0] == 0 and Y.shape[0] == 0:
-        return 0.0
-    if X.shape[0] == 0 or Y.shape[0] == 0:
-        return np.inf
-
-    dists_sq = cdist(X, Y, metric="sqeuclidean")  # (T_x, T_y)
-    d1_sq = np.sum(np.min(dists_sq, axis=1))      # sum_i min_j ||x_i - y_j||^2
-    d2_sq = np.sum(np.min(dists_sq, axis=0))      # sum_j min_i ||y_j - x_i||^2
-    return float(np.sqrt(0.5 * (d1_sq + d2_sq)))
-
-
-def compute_minkowski_distance_matrix(trajectories):
-    """
-    trajectories: list of arrays, each (T_i, A) = one action chunk (trajectory).
-    Returns D[i,j] = symmetrized_l2_minkowski_traj(traj_i, traj_j).
-    """
-    N = len(trajectories)
-    D = np.zeros((N, N), dtype=float)
-    for i in range(N):
-        for j in range(i + 1, N):
-            d = symmetrized_l2_minkowski_traj(trajectories[i], trajectories[j])
-            D[i, j] = D[j, i] = d
-    return D
-
-
-def _minkowski_variance_from_D(D):
-    """
-    D: (N, N) array of symmetrized Minkowski distances between chunks.
-    Here we use a simplified form:
-      Var := 0.5 * E[d^2]
-    where expectations are empirical over the N chunks.
-    """
-    D = np.asarray(D, float)
-    if D.size == 0:
-        return 0.0
-    if D.ndim != 2 or D.shape[0] != D.shape[1]:
-        raise ValueError(f"D must be square, got {D.shape}")
-
-    n = D.shape[0]
-    if n <= 1:
-        return 0.0
-
-    # Use only off-diagonal pairs to avoid bias from zero self-distances.
-    offdiag = ~np.eye(n, dtype=bool)
-    term1 = float(np.mean((D[offdiag]) ** 2))
-    return 0.5 * term1
-
-
-def total_variance_minkowski(D):
-    """Total variance of the set of action chunks, in Minkowski distance space."""
-    return _minkowski_variance_from_D(D)
-
-
-def weighted_incluster_variance_minkowski(D, labels):
-    """
-    D: (N, N) Minkowski distance matrix between chunks.
-    labels: cluster labels per chunk (length N).
-
-    Computes size-weighted average of cluster variances, with variance
-    defined via _minkowski_variance_from_D on each cluster submatrix.
-    """
-    labels = np.asarray(labels)
-    N = D.shape[0]
-    if N == 0:
-        return 0.0
-
-    wvar = 0.0
-    for c in np.unique(labels):
-        idx = np.where(labels == c)[0]
-        if idx.size == 0:
-            continue
-        Dc = D[np.ix_(idx, idx)]
-        var_c = _minkowski_variance_from_D(Dc)
-        wvar += (idx.size / N) * var_c
-    return float(wvar)
 
 
 # ------------------------------------------------------------
@@ -907,8 +668,6 @@ def load_cached_row_for_state(state_idx, per_state_dir, *, k, num_points, action
             continue
     return None
 
-import re, glob
-
 def _discover_lerobot_parquets(data_root: str):
     """
     Yield parquet paths under data_root. Tries common LeRobot DROID layouts:
@@ -1226,11 +985,11 @@ def _cluster_binary_drop_ratios_from_D(D_mink, labels):
         idx_rest = np.where(labels != c)[0]
 
         Dc = D_mink[np.ix_(idx_c, idx_c)]
-        var_c = _minkowski_variance_from_D(Dc)
+        var_c = minkowski_variance_from_D(Dc)
 
         if idx_rest.size > 0:
             Drest = D_mink[np.ix_(idx_rest, idx_rest)]
-            var_rest = _minkowski_variance_from_D(Drest)
+            var_rest = minkowski_variance_from_D(Drest)
         else:
             var_rest = 0.0
 
@@ -1806,6 +1565,8 @@ def main():
             showmeans=False,
             showmedians=True,
             showextrema=True,
+            points=30,
+            bw_method=0.2,
         )
 
         labels_with_n = [f"{pt}\\n(n={n})" for pt, n in zip(labels_pt, ns)]
