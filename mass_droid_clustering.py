@@ -34,7 +34,9 @@ Outputs:
   per-state .npz; per-k rows do not include labels.
 """
 
-import argparse, os, sys
+import argparse
+import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -44,7 +46,6 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import SpectralClustering
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import plotly.graph_objects as go
-import pdb
 
 from clustering_shared import (
     as_2d as _as_2d,
@@ -1087,10 +1088,9 @@ def main():
 
         # inferred chunk/step counts for later mapping
         if arr.ndim == 3:
-            Kc, Tc, _A = arr.shape
+            Kc, _Tc, _A = arr.shape
         else:
             Kc = arr.shape[0]
-            Tc = 1
 
         cache = best_labels_cache.get(state_idx, None)
 

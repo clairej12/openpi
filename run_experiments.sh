@@ -1,147 +1,31 @@
-# uv run record_trajectories.py \
-#   --config pi0_aloha_sim \
-#   --ckpt-dir gs://openpi-assets/checkpoints/pi0_aloha_sim \
-#   --env-factory openpi.envs.aloha_sim:make_env \
-#   --env-kwargs-json '{"render_mode":"rgb_array","seed":0}' \
-#   --num-episodes 5 \
-#   --max-episode-steps 200 \
-#   --out-dir rollouts \
-#   --save-video
+#!/usr/bin/env bash
+set -euo pipefail
 
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 100 \
-#     --port 8124 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 30 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 40 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 50 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 60 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 70 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 80 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 90 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_images
-
-# uv run record_droid_sanity_check.py \
-#     --data_dir /media/volume/models_and_data/DROID/ \
-#     --dataset_name droid_100 \
-#     --split train \
-#     --max_episodes 100 \
-#     --port 8123 \
-#     --prompt "" \
-#     --samples_per_state 50 \
-#     --save_npz \
-#     --checkpoint_by_episode \
-#     --out_dir droid_100_all \
-#     --image_dir droid_100_images
+# Override these per machine/session as needed.
+DATA_DIR="${DATA_DIR:-/media/volume/droid_data/DROID/droid_1.0.1/}"
+OUT_DIR="${OUT_DIR:-/media/volume/generated_data/pi0_output/droid/droid_1.0.1_lerobot}"
+PORT="${PORT:-8124}"
+MAX_EPISODES="${MAX_EPISODES:-200}"
+SAMPLES_PER_STATE="${SAMPLES_PER_STATE:-200}"
 
 uv run record_droid_sanity_check.py \
-    --data_dir /media/volume/droid_data/DROID/droid_1.0.1/ \
-    --format lerobot \
-    --max_episodes 200 \
-    --port 8124 \
-    --prompt "" \
-    --samples_per_state 200 \
-    --save_npz \
-    --checkpoint_by_episode \
-    --out_dir /media/volume/generated_data/pi0_output/droid/droid_1.0.1_lerobot \
-    --save_images false \
-    --frame_stride 1 \
-    --max_video_readers 8
+  --data_dir "$DATA_DIR" \
+  --format lerobot \
+  --max_episodes "$MAX_EPISODES" \
+  --port "$PORT" \
+  --prompt "" \
+  --samples_per_state "$SAMPLES_PER_STATE" \
+  --save_npz \
+  --checkpoint_by_episode \
+  --out_dir "$OUT_DIR" \
+  --save_images false \
+  --frame_stride 1 \
+  --max_video_readers 8
 
+# Optional metadata patching after rollout:
 # uv run patch_task_metadata.py \
-#   --metrics_csv /media/volume/generated_data/pi0_output/droid/droid_1.0.1_lerobot/all_multimodality/metrics_per_state.csv \
-#   --out_csv /media/volume/generated_data/pi0_output/droid/droid_1.0.1_lerobot/all_multimodality/metrics_per_state_patched.csv \
-#   --lerobot_root /media/volume/droid_data/DROID/droid_1.0.1/ \
-#   --summary_csv /media/volume/generated_data/pi0_output/droid/droid_1.0.1_lerobot/summary.csv \
-#   --summary_out_csv /media/volume/generated_data/pi0_output/droid/droid_1.0.1_lerobot/summary_patched.csv \
+#   --metrics_csv "$OUT_DIR/all_multimodality/metrics_per_state.csv" \
+#   --out_csv "$OUT_DIR/all_multimodality/metrics_per_state_patched.csv" \
+#   --lerobot_root "$DATA_DIR" \
+#   --summary_csv "$OUT_DIR/summary.csv" \
+#   --summary_out_csv "$OUT_DIR/summary_patched.csv"

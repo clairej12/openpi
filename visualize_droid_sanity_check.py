@@ -1,35 +1,20 @@
 #!/usr/bin/env python3
-import argparse, os
+import argparse
+import os
+
+import matplotlib.lines as mlines
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.cluster import SpectralClustering
 from sklearn.decomposition import PCA
-from scipy.spatial.distance import cdist
 from concurrent.futures import ProcessPoolExecutor
 
+from clustering_shared import as_2d as _as_2d
+from clustering_shared import compute_minkowski_distance_matrix
+
+
 # ---------- distance + clustering ----------
-def _as_2d(x):
-    x = np.asarray(x)
-    if x.ndim == 1: return x.reshape(-1, 1).astype(float, copy=False)
-    if x.ndim >= 3: x = x.reshape(x.shape[0], -1)
-    return x.astype(float, copy=False)
-
-def symmetrized_l2_minkowski(X, Y):
-    X = _as_2d(X); Y = _as_2d(Y)
-    dists = cdist(X, Y, metric="sqeuclidean")
-    d1_sq = np.sum(np.min(dists, axis=1))
-    d2_sq = np.sum(np.min(dists, axis=0))
-    return float(np.sqrt((d1_sq + d2_sq) / 2.0))
-
-def compute_minkowski_distance_matrix(trajectories):
-    N = len(trajectories); D = np.zeros((N, N), dtype=float)
-    for i in range(N):
-        for j in range(i+1, N):
-            d = symmetrized_l2_minkowski(trajectories[i], trajectories[j])
-            D[i, j] = D[j, i] = d
-    return D
-
 def spectral_cluster_minkowski(trajectories, n_clusters=3, sigma=None, random_state=0):
     D = compute_minkowski_distance_matrix(trajectories)
     pos = D[D > 0]
@@ -106,8 +91,6 @@ def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
                      point_size=1, line_width=1.0, line_alpha=0.6,
                      line_color_mode="per_sample",
                      start_marker_size=10, end_marker_size=20):
-    import numpy as np, matplotlib.lines as mlines
-    from matplotlib.cm import get_cmap
     fig = plt.figure(figsize=(7, 6))
     ax = fig.add_subplot(111, projection="3d")
     xyz = np.asarray(xyz); labels = np.asarray(labels).reshape(-1)
@@ -119,7 +102,7 @@ def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
         action_idx = np.array([r[2] for r in index_rows], dtype=int)
         unique_samples = np.unique(sample_idx)
         if line_color_mode == "per_sample":
-            cmap = get_cmap("tab20", len(unique_samples))
+            cmap = plt.get_cmap("tab20", len(unique_samples))
             sample_to_color = {s: cmap(i % cmap.N) for i, s in enumerate(unique_samples)}
         else:
             sample_to_color = {}
@@ -138,7 +121,6 @@ def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
             p0, p1 = pts[0], pts[-1]
             ax.scatter([p0[0]],[p0[1]],[p0[2]], s=start_marker_size, c="none", edgecolor="k", linewidths=1.0, marker="o")
             ax.scatter([p1[0]],[p1[1]],[p1[2]], s=end_marker_size, c="k", marker="x", linewidths=1.5)
-        import matplotlib.lines as mlines
         start_h = mlines.Line2D([], [], color="k", marker="o", markersize=6, markerfacecolor="none", linestyle="None", label="chunk start")
         end_h   = mlines.Line2D([], [], color="k", marker="x", markersize=7, linestyle="None", label="chunk end")
     legend_items = [mlines.Line2D([], [], color=scatter.cmap(scatter.norm(lab)), marker="s", linestyle="None", markersize=6, label=f"cluster {lab}") for lab in np.unique(labels)]
@@ -157,8 +139,6 @@ def plot_actions_xyz(xyz, labels, index_rows, png_path="", title="",
 
 def plot_per_cluster_panels(xyz, per_point_labels, index_rows, n_clusters, png_path, title_prefix="State",
                             point_size=3, line_width=1.0, line_alpha=0.6):
-    import numpy as np, matplotlib.lines as mlines
-    from matplotlib.cm import get_cmap
     xyz = np.asarray(xyz); labels = np.asarray(per_point_labels).reshape(-1)
     assert xyz.shape[0] == labels.shape[0] == len(index_rows)
     sample_idx = np.array([r[1] for r in index_rows], dtype=int)

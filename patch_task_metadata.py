@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-import argparse, os, re, glob
+import argparse
 import numpy as np
 import pandas as pd
+
+from droid_dataset_shared import discover_lerobot_parquets as _discover_lerobot_parquets
+
 
 def patch_table(csv_in, meta_df, csv_out, table_name="table"):
     df = pd.read_csv(csv_in)
@@ -41,16 +44,6 @@ def patch_table(csv_in, meta_df, csv_out, table_name="table"):
     print(f"[{table_name}] wrote {csv_out}")
     print(f"[{table_name}] empty task_name frac={tn_empty:.3f}, instruction frac={ins_empty:.3f}")
 
-
-# -------- LeRobot helpers (same conventions as your experiment) --------
-def _discover_lerobot_parquets(data_root: str):
-    pattern = os.path.join(data_root, "data", "chunk-*", "file-*.parquet")
-    for path in sorted(glob.glob(pattern)):
-        m_chunk = re.search(r"chunk-(\d+)", path)
-        m_file = re.search(r"file-(\d+)\.parquet$", path)
-        if not m_chunk or not m_file:
-            continue
-        yield int(m_chunk.group(1)), int(m_file.group(1)), path
 
 def build_lerobot_meta_map(data_root: str, max_rows_per_parquet=None):
     """

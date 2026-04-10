@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 import os
+
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-import argparse, atexit, logging, threading, time, os, re, glob
+import argparse
+import atexit
 import collections
-from typing import Dict, Tuple, Any, List, Optional
+import glob
+import logging
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 from PIL import Image
+
+from droid_dataset_shared import discover_lerobot_parquets as _discover_lerobot_parquets
 
 # --- OpenPI (server + client) ---
 from openpi.policies import policy as _policy
@@ -192,23 +201,6 @@ def _iter_rlds_steps(episode, tfds_module):
         pass
 
     raise TypeError(f"Unsupported 'steps' type: {type(episode['steps'])}")
-
-
-# =========================================================
-# LeRobot iterator
-# =========================================================
-def _discover_lerobot_parquets(data_root: str):
-    """Yield (chunk_idx, file_idx, parquet_path) for all available parquet files."""
-    pattern = os.path.join(data_root, "data", "chunk-*", "file-*.parquet")
-    for path in sorted(glob.glob(pattern)):
-        # .../chunk-000/file-001.parquet
-        m_chunk = re.search(r"chunk-(\d+)", path)
-        m_file = re.search(r"file-(\d+)\.parquet$", path)
-        if not m_chunk or not m_file:
-            continue
-        chunk_idx = int(m_chunk.group(1))
-        file_idx = int(m_file.group(1))
-        yield chunk_idx, file_idx, path
 
 
 class _VideoReaderCache:
@@ -458,7 +450,6 @@ def main():
     # =========================================================
     if data_format == "rlds":
         import tensorflow_datasets as tfds
-        import tensorflow as tf
         # load TFDS
         logging.info("Loading RLDS dataset %s from %s", args.dataset_name, args.data_dir)
         _ = tfds.builder(args.dataset_name, data_dir=args.data_dir).info
@@ -469,25 +460,15 @@ def main():
                 break
             logging.info("Processing episode %d ...", ep_idx)
 
-            # instruction accumulators
-            instr_accum = {
-                "language_instruction": set(),
-                "language_instruction_2": set(),
-                "language_instruction_3": set(),
-            }
             rows_ep.clear()
             actions_ep.clear()
 
             episode_id = None
-            task_name = None
-            instruction_any = None
 
             for t_in_ep, step_np in _iter_rlds_steps(episode, tfds):
                 if args.frame_stride > 1 and (int(t_in_ep) % args.frame_stride) != 0:
                     continue
                 g_idx += 1
-                # infer meta
-                meta = step_np  # already numpy-like
                 # try to get episode id etc. (keep your old logic here if you want)
                 # for RLDS we can just synthesize
                 if episode_id is None:
